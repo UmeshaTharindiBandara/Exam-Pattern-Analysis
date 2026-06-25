@@ -1,0 +1,663 @@
+"""Streamlit dashboard for AI-powered exam pattern analysis."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+from fpdf import FPDF
+from wordcloud import WordCloud
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.embeddings.embedder import QuestionEmbedder
+from src.evaluation.evaluator import ExamEvaluator
+from src.generation.question_generator import QuestionGenerator
+from src.pipeline import (
+    NoQuestionDataError,
+    QUESTIONS_CSV,
+    SUBJECT_MATERIALS_CSV,
+    append_questions,
+    append_subject_materials,
+    filter_by_subject,
+    get_subject_context,
+    get_subjects,
+    load_questions,
+    load_subject_materials,
+    run_analysis_pipeline,
+)
+from src.preprocessing.pdf_extractor import PDFExtractor
+from src.utils import PROCESSED_DIR, RAW_DIR, setup_logging
+
+logger = setup_logging("streamlit_app")
+
+st.set_page_config(
+    page_title="Exam Pattern Analysis",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+THEME_CSS = """
+<style>
+    /* Question cards — readable in both light and dark Streamlit themes */
+    .question-card {
+        background-color: #f0f4ff;
+        border: 1px solid #c5d5f5;
+        border-left: 4px solid #4f8ef7;
+        border-radius: 10px;
+        padding: 16px 20px;
+        margin-bottom: 12px;
+        color: #1a2240;
+    }
+
+    /* Dark theme override (Streamlit sets data-theme on html element) */
+    html[data-theme="dark"] .question-card,
+    [data-testid="stAppViewContainer"][class*="dark"] .question-card {
+        background-color: #1c2645;
+        border-color: #2e4a8a;
+        border-left-color: #5b9cf6;
+        color: #d8e4ff;
+    }
+
+    /* Metric cards: subtle tinted background for separation */
+    [data-testid="metric-container"] {
+        background-color: rgba(79, 142, 247, 0.07);
+        border: 1px solid rgba(79, 142, 247, 0.18);
+        border-radius: 10px;
+        padding: 14px 18px;
+    }
+
+    /* Sidebar separator */
+    div[data-testid="stSidebar"] > div:first-child {
+        border-right: 1px solid rgba(100, 116, 139, 0.25);
+    }
+
+    /* Improve tab label contrast */
+    button[data-baseweb="tab"] {
+        font-weight: 500;
+    }
+
+    /* Rounded, clearly visible primary buttons */
+    .stButton > button[kind="primary"] {
+        border-radius: 8px;
+        font-weight: 600;
+    }
+
+    /* Secondary buttons: clearly visible border */
+    .stButton > button[kind="secondary"] {
+        border-radius: 8px;
+        border-width: 1.5px;
+    }
+
+    /* Dataframe header row contrast boost */
+    [data-testid="stDataFrame"] th {
+        font-weight: 600 !important;
+    }
+</style>
+"""
+st.markdown(THEME_CSS, unsafe_allow_html=True)
+
+
+def init_session_state() -> None:
+    """Initialize Streamlit session state variables."""
+    defaults = {
+        "questions_df": None,
+        "topics_df": None,
+        "embeddings": None,
+        "subject_materials_df": None,
+        "generated_questions": [],
+        "analysis_ready": False,
+        "prompt_strategy": "context_aware",
+        "api_key": "",
+        "selected_subject_filter": "All Subjects",
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def run_full_analysis(force: bool = False) -> bool:
+    """Load uploaded PDF data and run the NLP analysis pipeline.
+
+    Args:
+        force: Force pipeline rerun.
+
+    Returns:
+        True if analysis completed successfully.
+    """
+    if st.session_state.analysis_ready and not force:
+        return st.session_state.questions_df is not None
+
+    try:
+        df = load_questions()
+        cache_key = f"exam_questions_{len(df)}"
+        annotated, topics, embeddings = run_analysis_pipeline(
+            df, force_recompute=force, cache_key=cache_key
+        )
+        st.session_state.questions_df = annotated
+        st.session_state.topics_df = topics
+        st.session_state.embeddings = embeddings
+        st.session_state.subject_materials_df = load_subject_materials()
+        st.session_state.analysis_ready = True
+        return True
+    except NoQuestionDataError as exc:
+        st.session_state.analysis_ready = False
+        st.session_state.questions_df = None
+        st.info(str(exc))
+        return False
+    except Exception as exc:
+        logger.exception("Analysis pipeline failed: %s", exc)
+        st.error(f"Analysis failed: {exc}")
+        return False
+
+
+def get_filtered_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame | None]:
+    """Return questions, topics, and embeddings filtered by selected subject."""
+    questions_df = st.session_state.questions_df
+    topics_df = st.session_state.topics_df
+    embeddings = st.session_state.embeddings
+    subject_filter = st.session_state.selected_subject_filter
+
+    if subject_filter == "All Subjects":
+        return questions_df, topics_df, embeddings
+
+    filtered_q = filter_by_subject(questions_df, subject_filter)
+    if filtered_q.empty:
+        return filtered_q, topics_df.iloc[0:0], None
+
+    topic_labels = filtered_q["topic_label"].unique().tolist()
+    filtered_t = topics_df[topics_df["topic_label"].isin(topic_labels)].copy()
+    indices = filtered_q.index.to_numpy()
+    filtered_e = embeddings[indices] if embeddings is not None else None
+    return filtered_q, filtered_t, filtered_e
+
+
+def subject_filter_widget() -> None:
+    """Render subject filter dropdown in the sidebar."""
+    subjects: list[str] = []
+    if st.session_state.questions_df is not None:
+        subjects = get_subjects(st.session_state.questions_df)
+
+    options = ["All Subjects"] + subjects
+    current = st.session_state.selected_subject_filter
+    if current not in options:
+        current = "All Subjects"
+
+    st.session_state.selected_subject_filter = st.sidebar.selectbox(
+        "Filter by Subject",
+        options,
+        index=options.index(current),
+    )
+
+
+def render_sidebar() -> None:
+    """Render sidebar navigation and settings."""
+    st.sidebar.title("Exam Pattern AI")
+    page = st.sidebar.radio(
+        "Navigation",
+        [
+            "Upload & Process",
+            "Topic Analysis",
+            "Question Predictions",
+            "Similarity Search",
+            "Analytics Dashboard",
+        ],
+    )
+
+    st.sidebar.divider()
+
+    if st.sidebar.button("Refresh Analysis"):
+        st.session_state.analysis_ready = False
+        run_full_analysis(force=True)
+        st.sidebar.success("Analysis refreshed.")
+
+    if st.sidebar.button("Clear All Uploaded Data", type="secondary"):
+        for path in [QUESTIONS_CSV, SUBJECT_MATERIALS_CSV]:
+            if path.exists():
+                path.unlink()
+        st.session_state.analysis_ready = False
+        st.session_state.questions_df = None
+        st.session_state.topics_df = None
+        st.session_state.embeddings = None
+        st.session_state.generated_questions = []
+        st.sidebar.warning("All uploaded data cleared.")
+
+    st.session_state.current_page = page
+
+    st.sidebar.divider()
+
+
+def page_upload_process() -> None:
+    """Render upload and PDF processing page."""
+    st.title("Upload & Process")
+    st.write(
+        "Upload **past exam papers** and **subject reference PDFs** (syllabus, notes, textbooks). "
+        "Enter any subject name — there are no predefined subjects."
+    )
+
+    tab_exam, tab_subject, tab_data = st.tabs(
+        ["Past Exam Papers", "Subject PDFs", "Uploaded Data"]
+    )
+
+    with tab_exam:
+        st.subheader("Upload Past Exam Papers")
+        exam_subject = st.text_input(
+            "Subject name for these exam papers",
+            placeholder="e.g. Organic Chemistry, Data Structures, Constitutional Law",
+            key="exam_subject_input",
+        )
+        exam_year = st.number_input(
+            "Exam year",
+            min_value=1990,
+            max_value=2100,
+            value=2024,
+            key="exam_year_input",
+        )
+        exam_files = st.file_uploader(
+            "Select exam paper PDFs",
+            type=["pdf"],
+            accept_multiple_files=True,
+            key="exam_uploader",
+        )
+
+        if st.button("Process Exam Papers", type="primary"):
+            if not exam_subject.strip():
+                st.error("Please enter a subject name before uploading.")
+            elif not exam_files:
+                st.error("Please select at least one exam paper PDF.")
+            else:
+                RAW_DIR.mkdir(parents=True, exist_ok=True)
+                extractor = PDFExtractor()
+                progress = st.progress(0)
+                processed_frames: list[pd.DataFrame] = []
+                errors: list[str] = []
+
+                for idx, uploaded in enumerate(exam_files):
+                    try:
+                        pdf_path = RAW_DIR / uploaded.name
+                        pdf_path.write_bytes(uploaded.getvalue())
+                        frame = extractor.process_pdf(
+                            pdf_path,
+                            subject=exam_subject.strip(),
+                            year=int(exam_year),
+                        )
+                        processed_frames.append(frame)
+                    except Exception as exc:
+                        logger.exception("PDF processing error: %s", exc)
+                        errors.append(f"{uploaded.name}: {exc}")
+
+                    progress.progress((idx + 1) / len(exam_files))
+
+                if processed_frames:
+                    combined = pd.concat(processed_frames, ignore_index=True)
+                    total = append_questions(combined)
+                    st.session_state.analysis_ready = False
+                    run_full_analysis(force=True)
+                    st.success(
+                        f"Extracted {len(combined)} questions for **{exam_subject.strip()}**. "
+                        f"Total questions in library: {len(total)}."
+                    )
+
+                for err in errors:
+                    st.error(err)
+
+    with tab_subject:
+        st.subheader("Upload Subject Reference PDFs")
+        st.caption(
+            "Syllabus, textbook chapters, or lecture notes. Used as context when generating "
+            "new questions via Gemini."
+        )
+        ref_subject = st.text_input(
+            "Subject name for these reference PDFs",
+            placeholder="e.g. Organic Chemistry, Machine Learning, History",
+            key="ref_subject_input",
+        )
+        ref_files = st.file_uploader(
+            "Select subject/syllabus PDFs",
+            type=["pdf"],
+            accept_multiple_files=True,
+            key="ref_uploader",
+        )
+
+        if st.button("Process Subject PDFs"):
+            if not ref_subject.strip():
+                st.error("Please enter a subject name before uploading.")
+            elif not ref_files:
+                st.error("Please select at least one subject PDF.")
+            else:
+                RAW_DIR.mkdir(parents=True, exist_ok=True)
+                extractor = PDFExtractor()
+                progress = st.progress(0)
+                material_frames: list[pd.DataFrame] = []
+                errors: list[str] = []
+
+                for idx, uploaded in enumerate(ref_files):
+                    try:
+                        pdf_path = RAW_DIR / uploaded.name
+                        pdf_path.write_bytes(uploaded.getvalue())
+                        frame = extractor.process_subject_pdf(
+                            pdf_path, subject=ref_subject.strip()
+                        )
+                        material_frames.append(frame)
+                    except Exception as exc:
+                        logger.exception("Subject PDF error: %s", exc)
+                        errors.append(f"{uploaded.name}: {exc}")
+
+                    progress.progress((idx + 1) / len(ref_files))
+
+                if material_frames:
+                    combined = pd.concat(material_frames, ignore_index=True)
+                    total = append_subject_materials(combined)
+                    st.session_state.subject_materials_df = total
+                    st.success(
+                        f"Saved {len(combined)} subject reference document(s) for "
+                        f"**{ref_subject.strip()}**."
+                    )
+
+                for err in errors:
+                    st.error(err)
+
+    with tab_data:
+        if run_full_analysis():
+            df = st.session_state.questions_df
+            st.metric("Total Questions", len(df))
+            st.metric("Subjects", len(get_subjects(df)))
+            st.metric("Source PDFs", df["source_file"].nunique() if "source_file" in df else 0)
+
+            materials = st.session_state.subject_materials_df
+            if materials is not None and not materials.empty:
+                st.subheader("Subject Reference PDFs")
+                st.dataframe(
+                    materials[["subject", "source_file"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            st.subheader("Extracted Questions")
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+
+def page_topic_analysis() -> None:
+    """Render topic analysis visualizations."""
+    st.title("Topic Analysis")
+    if not run_full_analysis():
+        return
+
+    questions_df, topics_df, _ = get_filtered_data()
+    if questions_df.empty:
+        st.warning("No questions for the selected subject filter.")
+        return
+
+    evaluator = ExamEvaluator()
+    subject_note = (
+        f" — {st.session_state.selected_subject_filter}"
+        if st.session_state.selected_subject_filter != "All Subjects"
+        else ""
+    )
+
+    top_topics = evaluator.top_topics_bar_data(topics_df, top_n=10)
+    if not top_topics.empty:
+        fig = evaluator.make_bar_chart(
+            top_topics,
+            x="question_count",
+            y="topic_label",
+            title=f"Top Topics Discovered from Your Exam Papers{subject_note}",
+        )
+        fig.update_layout(yaxis={"categoryorder": "total ascending"})
+        st.plotly_chart(fig, use_container_width=True)
+
+    trend_data = evaluator.topic_trend_line_data(topics_df)
+    if not trend_data.empty:
+        line_fig = evaluator.make_line_chart(
+            trend_data,
+            x="year",
+            y="count",
+            color="topic_label",
+            title="Topic Frequency Trends Over Years",
+        )
+        st.plotly_chart(line_fig, use_container_width=True)
+
+    if not topics_df.empty:
+        st.subheader("Topic Details")
+        selected_topic = st.selectbox("Select topic for word cloud", topics_df["topic_label"].tolist())
+        topic_questions = questions_df[questions_df["topic_label"] == selected_topic]
+        if not topic_questions.empty:
+            text_blob = " ".join(topic_questions["cleaned_text"].fillna("").tolist())
+            if text_blob.strip():
+                wc = WordCloud(
+                    width=900,
+                    height=400,
+                    background_color="#f0f4ff",
+                    colormap="Blues",
+                ).generate(text_blob)
+                st.image(wc.to_array(), use_container_width=True)
+
+        display_df = topics_df.copy()
+        if "trend" not in display_df.columns:
+            display_df["trend"] = "stable"
+        display_df["sample_questions"] = display_df["sample_questions"].apply(
+            lambda items: " | ".join(items[:2]) if isinstance(items, list) else str(items)
+        )
+        st.dataframe(
+            display_df[["topic_label", "question_count", "trend", "sample_questions"]],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+def page_question_predictions() -> None:
+    """Render LLM question prediction page."""
+    st.title("Question Predictions")
+    st.caption("Requires a valid Gemini API key. Questions are generated from your uploaded exam patterns.")
+
+    if not run_full_analysis():
+        return
+
+    questions_df, topics_df, _ = get_filtered_data()
+    if questions_df.empty or topics_df.empty:
+        st.warning("Upload exam papers and select a subject with data to generate questions.")
+        return
+
+    subjects_in_view = get_subjects(questions_df)
+    gen_subject = st.selectbox(
+        "Subject",
+        subjects_in_view,
+        help="Subject context sent to Gemini along with discovered topics.",
+    )
+    subject_questions = questions_df[questions_df["subject"] == gen_subject]
+    subject_topics = topics_df[
+        topics_df["topic_label"].isin(subject_questions["topic_label"].unique())
+    ]
+
+    topic = st.selectbox("Discovered Topic", subject_topics["topic_label"].tolist())
+    num_questions = st.slider("Number of Questions", min_value=1, max_value=10, value=5)
+    difficulty = st.radio("Difficulty Level", ["Easy", "Medium", "Hard"], horizontal=True)
+
+    if st.button("Generate Questions with Gemini", type="primary"):
+        if not st.session_state.api_key and not _env_gemini_key():
+            st.error("Gemini API key is required. Enter it in the sidebar or set GEMINI_API_KEY in .env.")
+        else:
+            sample = subject_questions[subject_questions["topic_label"] == topic][
+                "question_text"
+            ].tolist()
+            materials_df = (
+                st.session_state.subject_materials_df
+                if st.session_state.subject_materials_df is not None
+                else load_subject_materials()
+            )
+            subject_context = get_subject_context(gen_subject, materials_df)
+
+            generator = QuestionGenerator(
+                api_key=st.session_state.api_key or None,
+            )
+            try:
+                with st.spinner("Generating questions via Gemini..."):
+                    generated = generator.generate(
+                        topic=topic,
+                        num_questions=num_questions,
+                        difficulty=difficulty,
+                        strategy=st.session_state.prompt_strategy,
+                        subject=gen_subject,
+                        sample_questions=sample,
+                        subject_material=subject_context or None,
+                    )
+                st.session_state.generated_questions = generated
+            except Exception as exc:
+                logger.exception("Generation failed: %s", exc)
+                st.error(f"Generation failed: {exc}")
+
+    if st.session_state.generated_questions:
+        st.subheader(f"Generated Questions — {gen_subject}")
+        for idx, item in enumerate(st.session_state.generated_questions, start=1):
+            st.markdown(
+                f"""
+                <div class="question-card">
+                    <strong>Q{idx}. [{item.get('type', 'N/A').upper()} | {item.get('marks', 0)} marks]</strong><br/>
+                    {item.get('question', '')}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        gen_df = pd.DataFrame(st.session_state.generated_questions)
+        st.download_button(
+            "Download as CSV",
+            data=gen_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"predicted_{gen_subject.replace(' ', '_')}.csv",
+            mime="text/csv",
+        )
+
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font("Arial", size=12)
+        pdf.cell(0, 10, f"Predicted Exam Questions - {gen_subject}", ln=True)
+        for idx, item in enumerate(st.session_state.generated_questions, start=1):
+            question_text = (
+                f"{idx}. [{item.get('type', '')}] ({item.get('marks', 0)} marks) "
+                f"{item.get('question', '')}"
+            )
+            safe_text = question_text.encode("latin-1", errors="replace").decode("latin-1")
+            pdf.set_x(pdf.l_margin)
+            usable_width = pdf.w - pdf.l_margin - pdf.r_margin
+            pdf.multi_cell(usable_width, 8, str(safe_text))
+        st.download_button(
+            "Download as PDF",
+            data=bytes(pdf.output()),
+            file_name=f"predicted_{gen_subject.replace(' ', '_')}.pdf",
+            mime="application/pdf",
+        )
+
+
+def _env_gemini_key() -> bool:
+    """Check if Gemini API key exists in environment."""
+    import os
+
+    key = os.getenv("GEMINI_API_KEY", "")
+    return bool(key and key not in {"your_gemini_key_here", "your_key_here"})
+
+
+def page_similarity_search() -> None:
+    """Render semantic similarity search page."""
+    st.title("Similarity Search")
+    if not run_full_analysis():
+        return
+
+    questions_df, _, embeddings = get_filtered_data()
+    if questions_df.empty or embeddings is None:
+        st.warning("No data available for the selected subject.")
+        return
+
+    query = st.text_input("Enter a topic or question to search your uploaded exam papers")
+
+    if query and st.button("Find Similar Questions"):
+        embedder = QuestionEmbedder()
+        query_embedding = embedder.encode([query])[0]
+        scores = embedder.cosine_similarity(query_embedding, embeddings)
+        top_indices = scores.argsort()[::-1][:5]
+
+        st.subheader("Top 5 Most Similar Past Questions")
+        for rank, local_idx in enumerate(top_indices, start=1):
+            row = questions_df.iloc[local_idx]
+            st.markdown(
+                f"""
+                <div class="question-card">
+                    <strong>#{rank} | Similarity: {scores[local_idx]:.3f}</strong><br/>
+                    <em>{row.get('subject', '')} — {row.get('topic_label', 'Unknown Topic')} ({row.get('year', 'N/A')})</em><br/>
+                    {row.get('question_text', '')}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+
+def page_analytics_dashboard() -> None:
+    """Render analytics overview dashboard."""
+    st.title("Analytics Dashboard")
+    if not run_full_analysis():
+        return
+
+    questions_df, topics_df, _ = get_filtered_data()
+    if questions_df.empty:
+        st.warning("No data for the selected subject filter.")
+        return
+
+    evaluator = ExamEvaluator()
+    metrics = evaluator.get_overview_metrics(questions_df, topics_df)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Exam PDFs", metrics["total_papers"])
+    c2.metric("Questions Extracted", metrics["total_questions"])
+    c3.metric("Topics Discovered", metrics["topics_discovered"])
+    c4.metric("Subjects", len(get_subjects(questions_df)))
+
+    year_df = evaluator.year_distribution(questions_df)
+    if not year_df.empty:
+        st.plotly_chart(
+            px.bar(year_df, x="year", y="count", title="Year-wise Question Distribution"),
+            use_container_width=True,
+        )
+
+    if "subject" in questions_df.columns:
+        subj_df = questions_df.groupby("subject").size().reset_index(name="count")
+        st.plotly_chart(
+            px.bar(subj_df, x="subject", y="count", title="Questions by Subject"),
+            use_container_width=True,
+        )
+
+    diff_df = evaluator.difficulty_distribution(questions_df)
+    if not diff_df.empty:
+        st.plotly_chart(
+            evaluator.make_pie_chart(diff_df, "difficulty", "count", "Question Type Distribution"),
+            use_container_width=True,
+        )
+
+    corr = evaluator.topic_correlation_matrix(questions_df)
+    st.plotly_chart(
+        evaluator.make_heatmap(corr, "Topic Correlation Heatmap"),
+        use_container_width=True,
+    )
+
+
+def main() -> None:
+    """Main Streamlit application entry point."""
+    init_session_state()
+    render_sidebar()
+
+    page = st.session_state.get("current_page", "Upload & Process")
+    pages = {
+        "Upload & Process": page_upload_process,
+        "Topic Analysis": page_topic_analysis,
+        "Question Predictions": page_question_predictions,
+        "Similarity Search": page_similarity_search,
+        "Analytics Dashboard": page_analytics_dashboard,
+    }
+    pages[page]()
+
+
+if __name__ == "__main__":
+    main()

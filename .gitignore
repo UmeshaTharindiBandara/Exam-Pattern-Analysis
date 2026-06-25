@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.venv/
+venv/
+data/processed/*.csv
+data/processed/*.npy
+data/processed/*.pkl
+reports/error.log
+*.egg-info/
+dist/
+build/
+.ipynb_checkpoints/
