@@ -1,4 +1,4 @@
-"""LLM-powered exam question generation with Gemini."""
+"""LLM-powered exam question generation with Mistral."""
 
 from __future__ import annotations
 
@@ -19,28 +19,31 @@ PromptStrategy = Literal["direct", "chain_of_thought", "context_aware"]
 
 
 class QuestionGenerator:
-    """Generate probable future exam questions using the Gemini API."""
+    """Generate probable future exam questions using the Mistral API."""
 
     def __init__(
         self,
         api_key: str | None = None,
+        model: str = "mistral-large-latest",
     ) -> None:
         """Initialize the question generator.
 
         Args:
             api_key: Optional API key override.
+            model: Mistral model identifier.
         """
         self.api_key = api_key
+        self.model = model
 
     def _resolve_api_key(self) -> str:
         """Resolve API key from override or environment."""
         if self.api_key:
             return self.api_key
 
-        key = os.getenv("GEMINI_API_KEY", "")
+        key = os.getenv("MISTRAL_API_KEY", "")
         if not key or key == "your_key_here":
             raise ValueError(
-                "Gemini API key not configured. Set GEMINI_API_KEY in .env "
+                "Mistral API key not configured. Set MISTRAL_API_KEY in .env "
                 "or enter it in the sidebar."
             )
         return key
@@ -114,7 +117,7 @@ class QuestionGenerator:
         )
 
     def _call_llm(self, prompt: str) -> str:
-        """Call the Gemini API.
+        """Call the Mistral API.
 
         Args:
             prompt: User prompt.
@@ -125,17 +128,21 @@ class QuestionGenerator:
         api_key = self._resolve_api_key()
 
         try:
-            import google.generativeai as genai
+            from mistralai import Mistral
         except ImportError as exc:
             raise ValueError(
-                "google-generativeai package is not installed. "
-                "Run: pip install google-generativeai"
+                "mistralai package is not installed. "
+                "Run: pip install mistralai"
             ) from exc
 
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-2.5-flash")
-        response = model.generate_content(prompt)
-        return response.text
+        client = Mistral(api_key=api_key)
+        response = client.chat.complete(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_tokens=2500,
+        )
+        return response.choices[0].message.content or ""
 
     @staticmethod
     def _parse_json_response(raw_text: str) -> list[dict[str, Any]]:
@@ -186,7 +193,7 @@ class QuestionGenerator:
         sample_questions: list[str] | None = None,
         subject_material: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Generate structured exam questions via the Gemini API.
+        """Generate structured exam questions via the Mistral API.
 
         Args:
             topic: Topic to generate questions for.
@@ -216,5 +223,5 @@ class QuestionGenerator:
         raw = self._call_llm(prompt)
         questions = self._parse_json_response(raw)
         if not questions:
-            raise ValueError("Gemini returned no valid questions. Check your API key and try again.")
+            raise ValueError("Mistral returned no valid questions. Check your API key and try again.")
         return questions[:num_questions]

@@ -311,7 +311,7 @@ def page_upload_process() -> None:
         st.subheader("Upload Subject Reference PDFs")
         st.caption(
             "Syllabus, textbook chapters, or lecture notes. Used as context when generating "
-            "new questions via Gemini."
+            "new questions via Mistral."
         )
         ref_subject = st.text_input(
             "Subject name for these reference PDFs",
@@ -454,7 +454,7 @@ def page_topic_analysis() -> None:
 def page_question_predictions() -> None:
     """Render LLM question prediction page."""
     st.title("Question Predictions")
-    st.caption("Requires a valid Gemini API key. Questions are generated from your uploaded exam patterns.")
+    st.caption("Requires a valid Mistral API key. Questions are generated from your uploaded exam patterns.")
 
     if not run_full_analysis():
         return
@@ -468,7 +468,7 @@ def page_question_predictions() -> None:
     gen_subject = st.selectbox(
         "Subject",
         subjects_in_view,
-        help="Subject context sent to Gemini along with discovered topics.",
+        help="Subject context sent to Mistral along with discovered topics.",
     )
     subject_questions = questions_df[questions_df["subject"] == gen_subject]
     subject_topics = topics_df[
@@ -479,9 +479,9 @@ def page_question_predictions() -> None:
     num_questions = st.slider("Number of Questions", min_value=1, max_value=10, value=5)
     difficulty = st.radio("Difficulty Level", ["Easy", "Medium", "Hard"], horizontal=True)
 
-    if st.button("Generate Questions with Gemini", type="primary"):
-        if not st.session_state.api_key and not _env_gemini_key():
-            st.error("Gemini API key is required. Enter it in the sidebar or set GEMINI_API_KEY in .env.")
+    if st.button("Generate Questions with Mistral", type="primary"):
+        if not st.session_state.api_key and not _env_mistral_key():
+            st.error("Mistral API key is required. Enter it in the sidebar or set MISTRAL_API_KEY in .env.")
         else:
             sample = subject_questions[subject_questions["topic_label"] == topic][
                 "question_text"
@@ -497,7 +497,7 @@ def page_question_predictions() -> None:
                 api_key=st.session_state.api_key or None,
             )
             try:
-                with st.spinner("Generating questions via Gemini..."):
+                with st.spinner("Generating questions via Mistral..."):
                     generated = generator.generate(
                         topic=topic,
                         num_questions=num_questions,
@@ -554,12 +554,12 @@ def page_question_predictions() -> None:
         )
 
 
-def _env_gemini_key() -> bool:
-    """Check if Gemini API key exists in environment."""
+def _env_mistral_key() -> bool:
+    """Check if Mistral API key exists in environment."""
     import os
 
-    key = os.getenv("GEMINI_API_KEY", "")
-    return bool(key and key not in {"your_gemini_key_here", "your_key_here"})
+    key = os.getenv("MISTRAL_API_KEY", "")
+    return bool(key and key not in {"your_mistral_key_here", "your_key_here"})
 
 
 def page_similarity_search() -> None:
