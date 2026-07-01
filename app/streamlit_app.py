@@ -943,6 +943,70 @@ def _compute_bleu_rouge(
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
+def _compute_tfidf_evaluation(questions_df: pd.DataFrame) -> dict:
+    """Compute TF-IDF vectors, cluster them, and return evaluation data.
+
+    Returns a dict with keys:
+        silhouette_score, n_clusters, top_terms_per_topic, tfidf_matrix
+    """
+    import numpy as np
+    from sklearn.cluster import KMeans
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics import silhouette_score
+    from sklearn.metrics.pairwise import cosine_similarity
+
+    texts = questions_df["question_text"].fillna("").tolist()
+    n = len(texts)
+    if n < 4:
+        return {}
+
+    vectorizer = TfidfVectorizer(
+        max_features=500,
+        stop_words="english",
+        ngram_range=(1, 2),
+        min_df=1,
+    )
+    tfidf_matrix = vectorizer.fit_transform(texts)
+    feature_names = vectorizer.get_feature_names_out()
+
+    # Use same cluster-count formula as the main pipeline
+    max_k = min(10, max(2, n // 4))
+    min_k = min(3, max(2, n // 6))
+
+    best_k, best_score, best_labels = min_k, -1.0, None
+    for k in range(min_k, max_k + 1):
+        km = KMeans(n_clusters=k, random_state=42, n_init=10)
+        labels = km.fit_predict(tfidf_matrix)
+        if len(set(labels)) < 2:
+            continue
+        score = silhouette_score(tfidf_matrix, labels, metric="cosine")
+        if score > best_score:
+            best_score, best_k, best_labels = score, k, labels
+
+    # Top TF-IDF terms per cluster
+    top_terms: dict[int, list[str]] = {}
+    if best_labels is not None:
+        for cluster_id in sorted(set(best_labels)):
+            mask = best_labels == cluster_id
+            cluster_matrix = tfidf_matrix[mask]
+            mean_tfidf = cluster_matrix.mean(axis=0).A1
+            top_idx = mean_tfidf.argsort()[::-1][:5]
+            top_terms[int(cluster_id)] = [feature_names[i] for i in top_idx]
+
+    # Cosine similarity distribution (sample up to 200 pairs)
+    dense = tfidf_matrix.toarray()
+    sim_matrix = cosine_similarity(dense)
+    upper = sim_matrix[np.triu_indices(n, k=1)]
+
+    return {
+        "silhouette_score": round(float(best_score), 4),
+        "n_clusters": best_k,
+        "top_terms_per_topic": top_terms,
+        "similarity_distribution": upper.tolist(),
+        "labels": best_labels,
+    }
+
+
 def _get_tsne_cached(questions_df: pd.DataFrame, embeddings) -> pd.DataFrame:
     """Return t-SNE DataFrame, cached in session_state to avoid recomputing."""
     cache_key = f"_tsne_{len(questions_df)}_{embeddings.shape[0]}"
@@ -967,10 +1031,11 @@ def page_evaluation_metrics() -> None:
         st.warning("No data available for the selected subject filter.")
         return
 
-    tab_cluster, tab_tsne, tab_bleu = st.tabs([
+    tab_cluster, tab_tsne, tab_bleu, tab_embed = st.tabs([
         "Clustering Quality",
         "Embedding Visualisation (t-SNE)",
         "Generation Quality (BLEU / ROUGE)",
+        "Embedding Comparison (TF-IDF vs Sentence)",
     ])
 
     # ── Tab 1: Clustering Quality ────────────────────────────────────────────
@@ -1147,6 +1212,166 @@ def page_evaluation_metrics() -> None:
                     file_name="bleu_rouge_scores.csv",
                     mime="text/csv",
                 )
+
+    # ── Tab 4: Embedding Comparison ──────────────────────────────────────────
+    with tab_embed:
+        st.subheader("Embedding Method Comparison: TF-IDF vs Sentence Transformers")
+        st.write(
+            "Compares two fundamentally different ways of turning exam questions into "
+            "vectors.  **TF-IDF** uses word frequency statistics (fast, interpretable).  "
+            "**Sentence Transformers** (`all-MiniLM-L6-v2`) use deep learning to capture "
+            "semantic meaning even when different words express the same idea."
+        )
+
+        if st.button("Run Embedding Comparison", type="primary"):
+            with st.spinner("Computing TF-IDF vectors and clustering…"):
+                tfidf_result = _compute_tfidf_evaluation(questions_df)
+
+            if not tfidf_result:
+                st.warning("Need at least 4 questions to compare embedding methods.")
+            else:
+                # ── Silhouette comparison ────────────────────────────────────
+                st.subheader("Clustering Quality — Silhouette Score")
+
+                sil_sent = 0.0
+                if "topic_id" in questions_df.columns and len(set(questions_df["topic_id"])) >= 2:
+                    from sklearn.metrics import silhouette_score as _sil
+                    try:
+                        sil_sent = float(_sil(embeddings, questions_df["topic_id"].values))
+                    except Exception:
+                        pass
+
+                sil_tfidf = tfidf_result["silhouette_score"]
+                n_clust_tfidf = tfidf_result["n_clusters"]
+                n_clust_sent = int(questions_df["topic_id"].nunique()) if "topic_id" in questions_df.columns else 0
+
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.metric(
+                        "Sentence Transformer Silhouette",
+                        f"{sil_sent:.4f}",
+                        delta=f"{n_clust_sent} clusters",
+                        delta_color="off",
+                    )
+                with c2:
+                    st.metric(
+                        "TF-IDF Silhouette",
+                        f"{sil_tfidf:.4f}",
+                        delta=f"{n_clust_tfidf} clusters",
+                        delta_color="off",
+                    )
+
+                # Bar chart comparison
+                cmp_df = pd.DataFrame({
+                    "Method": ["TF-IDF", "Sentence Transformer"],
+                    "Silhouette Score": [sil_tfidf, sil_sent],
+                    "Clusters": [n_clust_tfidf, n_clust_sent],
+                })
+                fig_cmp = px.bar(
+                    cmp_df,
+                    x="Method",
+                    y="Silhouette Score",
+                    color="Method",
+                    text="Silhouette Score",
+                    title="Silhouette Score: TF-IDF vs Sentence Transformer",
+                    template="plotly_dark",
+                    color_discrete_map={
+                        "TF-IDF": "#f4a261",
+                        "Sentence Transformer": "#4cc9f0",
+                    },
+                )
+                fig_cmp.update_traces(texttemplate="%{text:.4f}", textposition="outside")
+                fig_cmp.update_layout(
+                    yaxis=dict(range=[0, 1]),
+                    showlegend=False,
+                    margin=dict(l=10, r=10, t=50, b=10),
+                )
+                st.plotly_chart(fig_cmp, use_container_width=True)
+
+                # Interpretation
+                winner = "Sentence Transformer" if sil_sent >= sil_tfidf else "TF-IDF"
+                diff = abs(sil_sent - sil_tfidf)
+                if diff < 0.02:
+                    interp = "Both methods produce **similar clustering quality** on your dataset."
+                elif winner == "Sentence Transformer":
+                    interp = (
+                        f"**Sentence Transformer wins** by {diff:.4f} — it captures semantic "
+                        "similarity better (e.g. 'compute the hash' and 'find the digest' cluster "
+                        "together even though the words differ)."
+                    )
+                else:
+                    interp = (
+                        f"**TF-IDF wins** by {diff:.4f} — your questions use very consistent "
+                        "keyword patterns so word-frequency statistics are sufficient."
+                    )
+                st.info(interp)
+
+                st.divider()
+
+                # ── Top TF-IDF terms per topic ───────────────────────────────
+                st.subheader("Top TF-IDF Keywords per Topic")
+                st.caption(
+                    "These are the highest-weighted terms for each topic cluster "
+                    "discovered by TF-IDF vectorization — useful for interpreting "
+                    "what each cluster is actually about."
+                )
+                top_terms = tfidf_result.get("top_terms_per_topic", {})
+                if top_terms:
+                    term_rows = [
+                        {"Topic": f"Topic {tid + 1}", "Top Keywords": " · ".join(terms)}
+                        for tid, terms in sorted(top_terms.items())
+                    ]
+                    st.dataframe(
+                        pd.DataFrame(term_rows),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                st.divider()
+
+                # ── Cosine similarity distribution ───────────────────────────
+                st.subheader("Pairwise Cosine Similarity Distribution")
+                st.caption(
+                    "Shows how similar questions are to each other under each method.  "
+                    "A tighter distribution near 0 means questions are well-separated; "
+                    "a peak near 1 means many questions are very similar."
+                )
+                sim_vals = tfidf_result.get("similarity_distribution", [])
+                if sim_vals:
+                    import numpy as np
+                    sim_df = pd.DataFrame({
+                        "Cosine Similarity": sim_vals,
+                        "Method": ["TF-IDF"] * len(sim_vals),
+                    })
+                    fig_hist = px.histogram(
+                        sim_df,
+                        x="Cosine Similarity",
+                        nbins=40,
+                        title="TF-IDF Pairwise Similarity Distribution",
+                        template="plotly_dark",
+                        color_discrete_sequence=["#f4a261"],
+                    )
+                    fig_hist.update_layout(margin=dict(l=10, r=10, t=50, b=10))
+                    st.plotly_chart(fig_hist, use_container_width=True)
+
+                    st.caption(
+                        f"Median similarity: **{float(np.median(sim_vals)):.4f}** | "
+                        f"Max: **{float(np.max(sim_vals)):.4f}** | "
+                        f"Pairs above 0.85: **{sum(1 for s in sim_vals if s >= 0.85)}**"
+                    )
+
+                # Download comparison summary
+                st.download_button(
+                    "Download Comparison Summary (CSV)",
+                    data=cmp_df.to_csv(index=False).encode("utf-8"),
+                    file_name="embedding_comparison.csv",
+                    mime="text/csv",
+                )
+        else:
+            st.info(
+                "Click **Run Embedding Comparison** to vectorise your questions with TF-IDF "
+                "and compare against the Sentence Transformer embeddings."
+            )
 
 
 def main() -> None:
