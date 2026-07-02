@@ -101,6 +101,139 @@ exam-pattern-analysis/
 └── scripts/               # Utility scripts
 ```
 
+## Retrieval Evaluation Metrics
+
+The **Retrieval Evaluation** tab in the dashboard measures how well the Pinecone vector retrieval + cross-encoder reranking pipeline performs. These metrics are computed against a set of relevance-labelled queries over the indexed exam question corpus.
+
+### What Is Being Evaluated?
+
+When you select a topic and generate questions, the system:
+1. Embeds your query using Sentence Transformers
+2. Retrieves the top-K most similar chunks from Pinecone
+3. Reranks them using a cross-encoder model
+4. Feeds the reranked context into Mistral for question generation
+
+The evaluation metrics measure the **quality of steps 2–3** — how relevant and well-ordered the retrieved results are.
+
+---
+
+### Metrics Explained
+
+#### 🎯 Precision@5
+> *Out of the 5 results returned, how many are actually relevant?*
+
+**Formula:**
+```
+Precision@5 = (Number of relevant results in top 5) / 5
+```
+
+| Score Range | Meaning |
+|-------------|---------|
+| 1.00 | All 5 results are relevant — perfect |
+| 0.60–0.79 | 3–4 relevant results — good |
+| < 0.40 | More than half are irrelevant — poor |
+
+**Our Result: `0.664`** — About 3–4 out of 5 retrieved chunks are relevant. Acceptable, as Mistral can filter minor noise from the context.
+
+**Relevance to this project:** Medium — even if 1–2 chunks are off-topic, Mistral's instruction following handles the noise reasonably well.
+
+---
+
+#### 🔍 Recall@5
+> *Out of ALL relevant documents in the corpus, how many did the system find within the top 5?*
+
+**Formula:**
+```
+Recall@5 = (Relevant results found in top 5) / (Total relevant results in corpus)
+```
+
+| Score Range | Meaning |
+|-------------|---------|
+| 1.00 | Every relevant result was retrieved — perfect |
+| 0.70–0.99 | Most relevant content retrieved — good |
+| < 0.50 | Significant relevant content missed — poor |
+
+**Our Result: `1.000`** ⭐ — Every relevant past exam question/chunk is retrieved within the top 5. Nothing is missed.
+
+**Relevance to this project:** **Highest priority.** Missing a relevant past question means a key exam pattern is never passed to Mistral, leading to weaker predictions. A perfect score here is critical.
+
+---
+
+#### 🥇 MRR (Mean Reciprocal Rank)
+> *On average, at what position does the FIRST relevant result appear?*
+
+**Formula:**
+```
+MRR = average of (1 / rank of first relevant result) across all queries
+```
+
+| Score | First Relevant Result Appears At |
+|-------|----------------------------------|
+| 1.00 | Position 1 (always first) |
+| 0.50 | Position ~2 |
+| 0.33 | Position ~3 |
+| < 0.25 | Position 4 or later — poor |
+
+**Our Result: `0.513`** — The most relevant result appears at approximately **rank 2** on average.
+
+**Relevance to this project:** High — the cross-encoder reranker should push the best-matching past question to rank 1. An MRR below 0.6 suggests the reranker ordering could be improved.
+
+---
+
+#### 📈 nDCG@5 (Normalized Discounted Cumulative Gain)
+> *Are the most relevant results ranked highest? Results at lower positions are penalised.*
+
+**Formula:**
+```
+nDCG@5 = DCG@5 / Ideal DCG@5
+
+DCG@5 = sum of (relevance_score / log2(rank + 1)) for rank 1 to 5
+```
+
+| Score Range | Meaning |
+|-------------|---------|
+| 0.90–1.00 | Near-perfect ranking — excellent |
+| 0.70–0.89 | Good ranking quality |
+| 0.50–0.69 | Moderate — ranking could be improved |
+| < 0.50 | Poor ranking — relevant results buried |
+
+**Our Result: `0.731`** — Relevant content is ranked near the top. The reranker is performing well overall.
+
+**Relevance to this project:** Very high — Mistral processes retrieved chunks in order. If the most relevant content is buried at rank 5, the generated questions will be less accurate. Good nDCG means better question generation quality.
+
+---
+
+### Results Summary
+
+| Metric | Score | Rating | Priority for This Project |
+|--------|-------|--------|--------------------------|
+| **Precision@5** | 0.664 | ✅ Good | Medium |
+| **Recall@5** | 1.000 | 🏆 Perfect | **Highest** |
+| **MRR** | 0.513 | ⚠️ Moderate | High |
+| **nDCG@5** | 0.731 | ✅ Good | Very High |
+
+---
+
+### How to Improve Scores
+
+| Metric | Improvement Strategy |
+|--------|---------------------|
+| **Precision@5** | Use stricter similarity thresholds in Pinecone; filter low-score chunks before reranking |
+| **MRR** | Fine-tune the cross-encoder reranker on domain-specific (exam) data |
+| **nDCG@5** | Increase the candidate pool (retrieve top-20, rerank to top-5) for better reranking signal |
+| **Recall@5** | Already perfect — maintain current embedding model and indexing strategy |
+
+---
+
+### Where to View Metrics in the App
+
+Navigate to **Retrieval Evaluation** tab in the Streamlit dashboard to:
+- Run live evaluation against your uploaded exam corpus
+- Adjust the value of `k` (default: 5) to test Precision@k, Recall@k, and nDCG@k
+- Compare performance before and after uploading additional reference PDFs
+
+---
+
 ## Screenshots
 
 
