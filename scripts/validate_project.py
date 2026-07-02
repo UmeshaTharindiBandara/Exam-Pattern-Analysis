@@ -13,6 +13,7 @@ def main() -> None:
     """Validate core module imports and syntax."""
     import py_compile
 
+    from src.agents.exam_agents import ExamAgentSystem
     from src.pipeline import NoQuestionDataError, load_questions
     from src.preprocessing.text_cleaner import TextCleaner
 
@@ -34,6 +35,10 @@ def main() -> None:
     assert "cleaned_text" in sample.columns
     assert "question_type" in sample.columns
     print("NLP pipeline check passed.")
+
+    agent_system = ExamAgentSystem()
+    assert agent_system.vector_store.index_name
+    print("Agent orchestration import passed.")
     print("Validation successful.")
 
 

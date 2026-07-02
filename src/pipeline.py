@@ -58,8 +58,22 @@ def load_subject_materials(path: Path | None = None) -> pd.DataFrame:
     """
     csv_path = path or SUBJECT_MATERIALS_CSV
     if not csv_path.exists():
-        return pd.DataFrame(columns=["subject", "source_file", "content_text"])
-    return pd.read_csv(csv_path)
+        return pd.DataFrame(
+            columns=[
+                "subject",
+                "source_file",
+                "page_index",
+                "chunk_id",
+                "content_type",
+                "content_text",
+            ]
+        )
+
+    df = pd.read_csv(csv_path)
+    for column in ["page_index", "chunk_id", "content_type"]:
+        if column not in df.columns:
+            df[column] = pd.NA
+    return df
 
 
 def get_subjects(df: pd.DataFrame) -> list[str]:
@@ -225,8 +239,11 @@ def append_subject_materials(new_df: pd.DataFrame) -> pd.DataFrame:
     else:
         combined = new_df
 
+    if "chunk_id" not in combined.columns:
+        combined["chunk_id"] = combined["source_file"].astype(str)
+
     combined.drop_duplicates(
-        subset=["subject", "source_file"],
+        subset=["subject", "source_file", "chunk_id"],
         keep="last",
         inplace=True,
     )

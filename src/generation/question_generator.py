@@ -1,4 +1,4 @@
-"""LLM-powered exam question generation with Gemini."""
+"""LLM-powered exam question generation with Mistral chat completions."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ PromptStrategy = Literal["direct", "chain_of_thought", "context_aware"]
 
 
 class QuestionGenerator:
-    """Generate probable future exam questions using the Gemini API."""
+    """Generate probable future exam questions using the Mistral API."""
 
     def __init__(
         self,
@@ -37,11 +37,10 @@ class QuestionGenerator:
         if self.api_key:
             return self.api_key
 
-        key = os.getenv("GEMINI_API_KEY", "")
+        key = os.getenv("MISTRAL_API_KEY", "")
         if not key or key == "your_key_here":
             raise ValueError(
-                "Gemini API key not configured. Set GEMINI_API_KEY in .env "
-                "or enter it in the sidebar."
+                "Mistral API key not configured. Set MISTRAL_API_KEY in .env or enter it in the sidebar."
             )
         return key
 
@@ -125,17 +124,30 @@ class QuestionGenerator:
         api_key = self._resolve_api_key()
 
         try:
-            import google.generativeai as genai
+            from mistralai import Mistral
         except ImportError as exc:
             raise ValueError(
-                "google-generativeai package is not installed. "
-                "Run: pip install google-generativeai"
+                "mistralai is not installed. Run: pip install mistralai"
             ) from exc
 
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-2.5-flash")
-        response = model.generate_content(prompt)
-        return response.text
+        model_name = os.getenv("MISTRAL_CHAT_MODEL", "mistral-medium-latest")
+        client = Mistral(api_key=api_key)
+        response = client.chat.complete(
+            model=model_name,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ],
+        )
+        content = response.choices[0].message.content
+        if isinstance(content, str):
+            return content
+        return "".join(
+            chunk.text if hasattr(chunk, "text") else str(chunk)
+            for chunk in content
+        )
 
     @staticmethod
     def _parse_json_response(raw_text: str) -> list[dict[str, Any]]:

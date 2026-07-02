@@ -15,9 +15,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.agents.exam_agents import ExamAgentSystem
 from src.embeddings.embedder import QuestionEmbedder
 from src.evaluation.evaluator import ExamEvaluator
-from src.generation.question_generator import QuestionGenerator
 from src.pipeline import (
     NoQuestionDataError,
     QUESTIONS_CSV,
@@ -116,6 +116,9 @@ def init_session_state() -> None:
         "prompt_strategy": "context_aware",
         "api_key": "",
         "selected_subject_filter": "All Subjects",
+        "index_sync_counts": {"questions": 0, "materials": 0},
+        "retrieval_metrics": None,
+        "retrieval_details": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -144,6 +147,12 @@ def run_full_analysis(force: bool = False) -> bool:
         st.session_state.topics_df = topics
         st.session_state.embeddings = embeddings
         st.session_state.subject_materials_df = load_subject_materials()
+        agent_system = get_agent_system()
+        st.session_state.index_sync_counts = agent_system.index_corpus(
+            annotated,
+            st.session_state.subject_materials_df,
+            question_embeddings=embeddings,
+        )
         st.session_state.analysis_ready = True
         return True
     except NoQuestionDataError as exc:
@@ -206,11 +215,14 @@ def render_sidebar() -> None:
             "Topic Analysis",
             "Question Predictions",
             "Similarity Search",
+            "Retrieval Evaluation",
             "Analytics Dashboard",
         ],
     )
 
     st.sidebar.divider()
+
+    subject_filter_widget()
 
     if st.sidebar.button("Refresh Analysis"):
         st.session_state.analysis_ready = False
@@ -218,6 +230,9 @@ def render_sidebar() -> None:
         st.sidebar.success("Analysis refreshed.")
 
     if st.sidebar.button("Clear All Uploaded Data", type="secondary"):
+        agent_system = get_agent_system()
+        agent_system.vector_store.delete_namespace("past-papers")
+        agent_system.vector_store.delete_namespace("lecture-pdfs")
         for path in [QUESTIONS_CSV, SUBJECT_MATERIALS_CSV]:
             if path.exists():
                 path.unlink()
@@ -231,6 +246,12 @@ def render_sidebar() -> None:
     st.session_state.current_page = page
 
     st.sidebar.divider()
+
+
+@st.cache_resource
+def get_agent_system() -> ExamAgentSystem:
+    """Return the shared multi-agent orchestration system."""
+    return ExamAgentSystem()
 
 
 def page_upload_process() -> None:
@@ -355,6 +376,8 @@ def page_upload_process() -> None:
                     combined = pd.concat(material_frames, ignore_index=True)
                     total = append_subject_materials(combined)
                     st.session_state.subject_materials_df = total
+                    st.session_state.analysis_ready = False
+                    run_full_analysis(force=True)
                     st.success(
                         f"Saved {len(combined)} subject reference document(s) for "
                         f"**{ref_subject.strip()}**."
@@ -454,7 +477,7 @@ def page_topic_analysis() -> None:
 def page_question_predictions() -> None:
     """Render LLM question prediction page."""
     st.title("Question Predictions")
-    st.caption("Requires a valid Gemini API key. Questions are generated from your uploaded exam patterns.")
+    st.caption("Requires a valid Mistral API key. Questions are generated from your uploaded exam patterns.")
 
     if not run_full_analysis():
         return
@@ -475,37 +498,35 @@ def page_question_predictions() -> None:
         topics_df["topic_label"].isin(subject_questions["topic_label"].unique())
     ]
 
+    if subject_topics.empty:
+        st.warning("No discovered topics found for the selected subject yet.")
+        return
+
     topic = st.selectbox("Discovered Topic", subject_topics["topic_label"].tolist())
     num_questions = st.slider("Number of Questions", min_value=1, max_value=10, value=5)
     difficulty = st.radio("Difficulty Level", ["Easy", "Medium", "Hard"], horizontal=True)
 
-    if st.button("Generate Questions with Gemini", type="primary"):
-        if not st.session_state.api_key and not _env_gemini_key():
-            st.error("Gemini API key is required. Enter it in the sidebar or set GEMINI_API_KEY in .env.")
+    if st.button("Generate Questions with Mistral", type="primary"):
+        if not st.session_state.api_key and not _env_mistral_key():
+            st.error("Mistral API key is required. Enter it in the sidebar or set MISTRAL_API_KEY in .env.")
         else:
-            sample = subject_questions[subject_questions["topic_label"] == topic][
-                "question_text"
-            ].tolist()
-            materials_df = (
-                st.session_state.subject_materials_df
-                if st.session_state.subject_materials_df is not None
-                else load_subject_materials()
-            )
-            subject_context = get_subject_context(gen_subject, materials_df)
-
-            generator = QuestionGenerator(
-                api_key=st.session_state.api_key or None,
-            )
             try:
-                with st.spinner("Generating questions via Gemini..."):
-                    generated = generator.generate(
+                with st.spinner("Generating questions via Mistral..."):
+                    agent_system = get_agent_system()
+                    materials_df = (
+                        st.session_state.subject_materials_df
+                        if st.session_state.subject_materials_df is not None
+                        else load_subject_materials()
+                    )
+                    generated = agent_system.prediction_agent.generate(
                         topic=topic,
                         num_questions=num_questions,
                         difficulty=difficulty,
                         strategy=st.session_state.prompt_strategy,
                         subject=gen_subject,
-                        sample_questions=sample,
-                        subject_material=subject_context or None,
+                        questions_df=questions_df,
+                        topics_df=topics_df,
+                        materials_df=materials_df,
                     )
                 st.session_state.generated_questions = generated
             except Exception as exc:
@@ -555,11 +576,19 @@ def page_question_predictions() -> None:
 
 
 def _env_gemini_key() -> bool:
-    """Check if Gemini API key exists in environment."""
+    """Backward-compatible check for the previous Gemini key name."""
     import os
 
     key = os.getenv("GEMINI_API_KEY", "")
     return bool(key and key not in {"your_gemini_key_here", "your_key_here"})
+
+
+def _env_mistral_key() -> bool:
+    """Check if a Mistral API key exists in environment."""
+    import os
+
+    key = os.getenv("MISTRAL_API_KEY", "")
+    return bool(key and key not in {"your_mistral_key_here", "your_key_here"})
 
 
 def page_similarity_search() -> None:
@@ -576,24 +605,87 @@ def page_similarity_search() -> None:
     query = st.text_input("Enter a topic or question to search your uploaded exam papers")
 
     if query and st.button("Find Similar Questions"):
-        embedder = QuestionEmbedder()
-        query_embedding = embedder.encode([query])[0]
-        scores = embedder.cosine_similarity(query_embedding, embeddings)
-        top_indices = scores.argsort()[::-1][:5]
+        agent_system = get_agent_system()
+        materials_df = (
+            st.session_state.subject_materials_df
+            if st.session_state.subject_materials_df is not None
+            else load_subject_materials()
+        )
+        subject_name = st.session_state.selected_subject_filter
+        if subject_name == "All Subjects":
+            subject_name = ""
+
+        retrieval = agent_system.prediction_agent.retrieve_context(
+            query=query,
+            subject=subject_name,
+            questions_df=questions_df,
+            materials_df=materials_df,
+            top_k=5,
+        )
 
         st.subheader("Top 5 Most Similar Past Questions")
-        for rank, local_idx in enumerate(top_indices, start=1):
-            row = questions_df.iloc[local_idx]
+        if retrieval.matches.empty:
+            st.info("No Pinecone matches returned yet. Upload more PDFs or check the index configuration.")
+            return
+
+        for rank, (_, row) in enumerate(retrieval.matches.head(5).iterrows(), start=1):
             st.markdown(
                 f"""
                 <div class="question-card">
-                    <strong>#{rank} | Similarity: {scores[local_idx]:.3f}</strong><br/>
-                    <em>{row.get('subject', '')} — {row.get('topic_label', 'Unknown Topic')} ({row.get('year', 'N/A')})</em><br/>
-                    {row.get('question_text', '')}
+                    <strong>#{rank} | Similarity: {row.get('rerank_score', row.get('score', 0.0)):.3f}</strong><br/>
+                    <em>{row.get('subject', '')} — {row.get('topic_label', 'Unknown Topic')} ({row.get('metadata', {}).get('year', 'N/A')})</em><br/>
+                    {row.get('text', '')}
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
+
+
+def page_retrieval_evaluation() -> None:
+    """Render retrieval quality metrics and ranking diagnostics."""
+    st.title("Retrieval Evaluation")
+    if not run_full_analysis():
+        return
+
+    questions_df, _, _ = get_filtered_data()
+    materials_df = (
+        st.session_state.subject_materials_df
+        if st.session_state.subject_materials_df is not None
+        else load_subject_materials()
+    )
+
+    if questions_df.empty:
+        st.warning("No questions available to evaluate retrieval.")
+        return
+
+    subject_name = None if st.session_state.selected_subject_filter == "All Subjects" else st.session_state.selected_subject_filter
+    agent_system = get_agent_system()
+    summary, details = agent_system.evaluation_agent.evaluate_retrieval(
+        questions_df,
+        materials_df,
+        subject=subject_name,
+        sample_size=25,
+        top_k=5,
+    )
+
+    st.session_state.retrieval_metrics = summary
+    st.session_state.retrieval_details = details
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Precision@5", f"{summary.precision_at_k:.3f}")
+    c2.metric("Recall@5", f"{summary.recall_at_k:.3f}")
+    c3.metric("MRR", f"{summary.mean_reciprocal_rank:.3f}")
+    c4.metric("nDCG@5", f"{summary.ndcg_at_k:.3f}")
+
+    st.caption(f"Evaluated queries: {summary.evaluated_queries}")
+
+    if not details.empty:
+        st.subheader("Sample Retrieval Judgements")
+        st.dataframe(
+            details[["query_question", "retrieved_text", "rank_score", "topic_label", "query_topic", "is_relevant"]],
+            use_container_width=True,
+            hide_index=True,
+        )
 
 
 def page_analytics_dashboard() -> None:
@@ -654,6 +746,7 @@ def main() -> None:
         "Topic Analysis": page_topic_analysis,
         "Question Predictions": page_question_predictions,
         "Similarity Search": page_similarity_search,
+        "Retrieval Evaluation": page_retrieval_evaluation,
         "Analytics Dashboard": page_analytics_dashboard,
     }
     pages[page]()
