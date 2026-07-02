@@ -136,6 +136,7 @@ def run_analysis_pipeline(
     df: pd.DataFrame,
     force_recompute: bool = False,
     cache_key: str = "exam_questions",
+    embedder: QuestionEmbedder | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, np.ndarray]:
     """Run NLP enrichment, embedding, and topic clustering pipeline.
 
@@ -146,6 +147,10 @@ def run_analysis_pipeline(
         df: Questions dataframe from uploaded PDFs.
         force_recompute: Force embedding recomputation.
         cache_key: Embedding cache identifier.
+        embedder: Optional shared QuestionEmbedder instance. Callers that run this
+            repeatedly (e.g. a long-lived app process) should pass in one cached
+            instance rather than letting this function load its own copy of the
+            embedding model every call.
 
     Returns:
         Tuple of (annotated questions, topic summary, embeddings).
@@ -156,7 +161,7 @@ def run_analysis_pipeline(
     cleaner = TextCleaner()
     enriched = cleaner.enrich_dataframe(df)
 
-    embedder = QuestionEmbedder()
+    embedder = embedder or QuestionEmbedder()
     embeddings = embedder.encode_dataframe(
         enriched,
         text_column="question_text",

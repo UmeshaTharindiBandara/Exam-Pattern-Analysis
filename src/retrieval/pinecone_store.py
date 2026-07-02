@@ -31,12 +31,17 @@ class PineconeMatch:
 class PineconeVectorStore:
     """Store and retrieve embeddings from Pinecone."""
 
-    def __init__(self, index_name: str | None = None, api_key: str | None = None) -> None:
+    def __init__(
+        self,
+        index_name: str | None = None,
+        api_key: str | None = None,
+        embedder: QuestionEmbedder | None = None,
+    ) -> None:
         self.api_key = api_key or os.getenv("PINECONE_API_KEY", "")
         self.index_name = index_name or os.getenv("PINECONE_INDEX_NAME", "quickstart")
         self._client: Any | None = None
         self._index: Any | None = None
-        self._embedder: QuestionEmbedder | None = None
+        self._embedder: QuestionEmbedder | None = embedder
 
     def _get_client(self) -> Any:
         if self._client is not None:

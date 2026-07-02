@@ -8,6 +8,7 @@ from typing import Any
 import pandas as pd
 from dotenv import load_dotenv
 
+from src.embeddings.embedder import QuestionEmbedder
 from src.evaluation.retrieval_metrics import RetrievalMetricSummary, compute_retrieval_metrics
 from src.generation.question_generator import QuestionGenerator
 from src.pipeline import get_subject_context
@@ -217,8 +218,8 @@ class EvaluationAgent:
 class ExamAgentSystem:
     """Coordinates the specialist agents used by the app."""
 
-    def __init__(self) -> None:
-        self.vector_store = PineconeVectorStore()
+    def __init__(self, embedder: QuestionEmbedder | None = None) -> None:
+        self.vector_store = PineconeVectorStore(embedder=embedder)
         self.reranker = QuestionReranker()
         self.generator = QuestionGenerator()
         self.paper_agent = PastPaperAgent()

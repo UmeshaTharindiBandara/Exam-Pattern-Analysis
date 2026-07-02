@@ -21,7 +21,7 @@ def main() -> int:
         return 2
 
     try:
-        from mistralai import Mistral
+        from mistralai.client import Mistral
     except Exception as exc:  # pragma: no cover
         print(f"ERROR: mistralai import failed: {exc}")
         return 3

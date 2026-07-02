@@ -14,7 +14,7 @@ QuestionType = Literal["MCQ", "short_answer", "essay", "calculation", "unknown"]
 class BERTQuestionClassifier:
     """Classify exam questions using a DistilBERT zero-shot model."""
 
-    def __init__(self, model_name: str = "typeform/distil-bert-base-uncased-mnli") -> None:
+    def __init__(self, model_name: str = "typeform/distilbert-base-uncased-mnli") -> None:
         """Initialize the classifier.
 
         Args:

@@ -33,7 +33,7 @@ class MistralOCRClient:
             )
 
         try:
-            from mistralai import Mistral
+            from mistralai.client import Mistral
         except ImportError as exc:
             raise ValueError(
                 "mistralai is not installed. Run: pip install mistralai"

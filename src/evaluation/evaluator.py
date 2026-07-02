@@ -184,3 +184,76 @@ class ExamEvaluator:
         )
         fig.update_layout(margin=dict(l=20, r=20, t=50, b=20))
         return fig
+
+    @staticmethod
+    def find_cross_paper_duplicates(
+        questions_df: pd.DataFrame,
+        embeddings: np.ndarray,
+        threshold: float = 0.85,
+    ) -> pd.DataFrame:
+        """Find similar or repeated questions that appear across different exam papers.
+
+        Uses vectorised cosine similarity so it stays fast even for large question sets.
+
+        Args:
+            questions_df: Questions dataframe (must have a source_file column).
+            embeddings: Embedding matrix aligned row-for-row with questions_df.
+            threshold: Minimum cosine similarity to consider two questions similar.
+
+        Returns:
+            DataFrame of matching pairs sorted by similarity descending, with columns:
+            similarity, question_a, source_a, year_a, subject_a,
+            question_b, source_b, year_b, subject_b.
+            Empty DataFrame if fewer than two distinct PDFs are present.
+        """
+        from sklearn.metrics.pairwise import cosine_similarity as _sk_cosine
+
+        if embeddings is None or len(questions_df) < 2:
+            return pd.DataFrame()
+
+        q = questions_df.reset_index(drop=True)
+
+        sources = (
+            q["source_file"].astype(str).values
+            if "source_file" in q.columns
+            else np.full(len(q), "")
+        )
+        if len(set(sources)) < 2:
+            return pd.DataFrame()
+
+        sim_matrix = _sk_cosine(embeddings).astype(np.float32)
+
+        # Vectorised: find all upper-triangle pairs above threshold
+        i_idx, j_idx = np.where(np.triu(sim_matrix >= threshold, k=1))
+
+        if len(i_idx) == 0:
+            return pd.DataFrame()
+
+        # Keep only pairs from different source PDFs
+        diff_mask = sources[i_idx] != sources[j_idx]
+        i_idx = i_idx[diff_mask]
+        j_idx = j_idx[diff_mask]
+
+        if len(i_idx) == 0:
+            return pd.DataFrame()
+
+        texts = q["question_text"].astype(str).values
+        years = q["year"].values if "year" in q.columns else np.full(len(q), "N/A")
+        subjects = (
+            q["subject"].astype(str).values if "subject" in q.columns else np.full(len(q), "")
+        )
+
+        result = pd.DataFrame(
+            {
+                "similarity": np.round(sim_matrix[i_idx, j_idx].astype(float), 4),
+                "question_a": texts[i_idx],
+                "source_a": sources[i_idx],
+                "year_a": years[i_idx],
+                "subject_a": subjects[i_idx],
+                "question_b": texts[j_idx],
+                "source_b": sources[j_idx],
+                "year_b": years[j_idx],
+                "subject_b": subjects[j_idx],
+            }
+        )
+        return result.sort_values("similarity", ascending=False).reset_index(drop=True)

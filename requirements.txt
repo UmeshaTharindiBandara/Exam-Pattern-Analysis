@@ -12,5 +12,5 @@ plotly>=5.18.0
 python-dotenv>=1.0.0
 wordcloud>=1.9.0
 fpdf2>=2.7.0
-mistralai>=1.8.0
+mistralai>=2.0.0
 pinecone>=5.0.0
