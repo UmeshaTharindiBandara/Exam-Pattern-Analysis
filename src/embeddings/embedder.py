@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Iterable
 
 import numpy as np
 import pandas as pd
+
+os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+os.environ.setdefault("USE_TF", "0")
+
 from sentence_transformers import SentenceTransformer
 
 from src.utils import PROCESSED_DIR, setup_logging
 
 logger = setup_logging(__name__)
 
-DEFAULT_MODEL = "all-MiniLM-L6-v2"
+DEFAULT_MODEL = "BAAI/bge-large-en-v1.5"  # 1024-dim, matches the Pinecone index dimension
 
 
 class QuestionEmbedder:
@@ -66,7 +71,7 @@ class QuestionEmbedder:
         """
         text_list = list(texts)
         if not text_list:
-            return np.empty((0, 384), dtype=np.float32)
+            return np.empty((0, self.model.get_embedding_dimension()), dtype=np.float32)
 
         embeddings = self.model.encode(
             text_list,
@@ -103,8 +108,16 @@ class QuestionEmbedder:
             if len(cached_meta) == len(df) and cached_meta["question_text"].tolist() == df[
                 text_column
             ].tolist():
-                logger.info("Loading cached embeddings from %s", cache_path)
-                return np.load(cache_path)
+                cached = np.load(cache_path)
+                if cached.shape[1] == self.model.get_embedding_dimension():
+                    logger.info("Loading cached embeddings from %s", cache_path)
+                    return cached
+                logger.warning(
+                    "Cached embeddings at %s have dimension %d but model %s produces %d — "
+                    "recomputing instead of returning a stale, incompatible cache.",
+                    cache_path, cached.shape[1], self.model_name,
+                    self.model.get_embedding_dimension(),
+                )
 
         texts = df[text_column].astype(str).tolist()
         embeddings = self.encode(texts, show_progress=False)

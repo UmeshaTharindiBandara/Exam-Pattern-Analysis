@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import re
+import tempfile
 import sys
 from pathlib import Path
 
@@ -15,25 +18,18 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.agents.exam_agents import ExamAgentSystem
 from src.embeddings.embedder import QuestionEmbedder
 from src.evaluation.evaluator import ExamEvaluator
-from src.generation.question_generator import QuestionGenerator
 from src.pipeline import (
     NoQuestionDataError,
-    QUESTIONS_CSV,
-    SUBJECT_MATERIALS_CSV,
-    append_questions,
-    append_subject_materials,
     filter_by_subject,
     get_subject_context,
     get_subjects,
-    load_questions,
-    load_subject_materials,
     run_analysis_pipeline,
 )
 from src.preprocessing.pdf_extractor import PDFExtractor
-from src.preprocessing.text_cleaner import fix_spacing
-from src.utils import PROCESSED_DIR, RAW_DIR, setup_logging
+from src.utils import setup_logging
 
 logger = setup_logging("streamlit_app")
 
@@ -64,6 +60,30 @@ THEME_CSS = """
         border-color: #2e4a8a;
         border-left-color: #5b9cf6;
         color: #d8e4ff;
+    }
+
+    /* MCQ options list inside question cards */
+    .question-card .mcq-question {
+        margin-bottom: 10px;
+        font-size: 0.97rem;
+        line-height: 1.55;
+    }
+    .question-card .mcq-options {
+        list-style: none;
+        padding: 0;
+        margin: 8px 0 0 0;
+    }
+    .question-card .mcq-options li {
+        padding: 5px 10px;
+        margin: 4px 0;
+        border-radius: 6px;
+        background-color: rgba(79, 142, 247, 0.08);
+        border: 1px solid rgba(79, 142, 247, 0.18);
+        font-size: 0.93rem;
+    }
+    html[data-theme="dark"] .question-card .mcq-options li {
+        background-color: rgba(91, 156, 246, 0.12);
+        border-color: rgba(91, 156, 246, 0.25);
     }
 
     /* Metric cards: subtle tinted background for separation */
@@ -142,10 +162,67 @@ THEME_CSS = """
 """
 st.markdown(THEME_CSS, unsafe_allow_html=True)
 
+import re as _re
+
+_MCQ_OPTION_RE = _re.compile(
+    r"(?<![\w])([A-D])[.):]\s+",
+    _re.IGNORECASE,
+)
+
+
+def _split_mcq_options(text: str) -> tuple[str, list[tuple[str, str]]]:
+    """Split a question string into the stem and MCQ options if present.
+
+    Returns:
+        (stem, options_list) where options_list is a list of (letter, text) tuples.
+        If no options are detected both returned values represent the full text.
+    """
+    # Find positions of A. / B. / C. / D. option markers
+    positions = [(m.group(1).upper(), m.start()) for m in _MCQ_OPTION_RE.finditer(text)]
+    # Only treat as MCQ when at least 2 sequential options are found starting with A
+    letters = [p[0] for p in positions]
+    if len(positions) < 2 or "A" not in letters:
+        return text, []
+
+    first_option_start = positions[0][1]
+    stem = text[:first_option_start].strip()
+    options: list[tuple[str, str]] = []
+    for i, (letter, start) in enumerate(positions):
+        end = positions[i + 1][1] if i + 1 < len(positions) else len(text)
+        # Strip the leading "A. " / "B. " marker itself before recording option text
+        option_text = _MCQ_OPTION_RE.sub("", text[start:end], count=1).strip()
+        options.append((letter, option_text))
+    return stem, options
+
+
+def render_question_card(idx: int, item: dict) -> str:
+    """Build an HTML question card with MCQ options on separate lines."""
+    label = f"Q{idx}. [{item.get('type', 'N/A').upper()} | {item.get('marks', 0)} marks]"
+    question_raw = item.get("question", "")
+    stem, options = _split_mcq_options(question_raw)
+
+    options_html = ""
+    if options:
+        li_items = "".join(
+            f"<li><strong>{letter}.</strong>&nbsp;{opt_text}</li>"
+            for letter, opt_text in options
+        )
+        options_html = f'<ul class="mcq-options">{li_items}</ul>'
+
+    return (
+        f'<div class="question-card">'
+        f"<strong>{label}</strong><br/>"
+        f'<div class="mcq-question">{stem}</div>'
+        f"{options_html}"
+        f"</div>"
+    )
+
 
 def init_session_state() -> None:
     """Initialize Streamlit session state variables."""
     defaults = {
+        "questions_raw_df": None,
+        "subject_materials_raw_df": None,
         "questions_df": None,
         "topics_df": None,
         "embeddings": None,
@@ -155,9 +232,9 @@ def init_session_state() -> None:
         "prompt_strategy": "context_aware",
         "api_key": "",
         "selected_subject_filter": "All Subjects",
-        "silhouette_score": 0.0,
-        "gen_topic_for_bleu": "",
-        "gen_subject_for_bleu": "",
+        "index_sync_counts": {"questions": 0, "materials": 0},
+        "retrieval_metrics": None,
+        "retrieval_details": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -176,16 +253,30 @@ def run_full_analysis(force: bool = False) -> bool:
     if st.session_state.analysis_ready and not force:
         return st.session_state.questions_df is not None
 
+    raw_questions_df = st.session_state.questions_raw_df
+    if raw_questions_df is None or raw_questions_df.empty:
+        st.info("Upload past exam PDFs to begin analysis.")
+        st.session_state.analysis_ready = False
+        return False
+
     try:
-        df = load_questions()
-        cache_key = f"exam_questions_{len(df)}"
+        cache_key = f"exam_questions_{len(raw_questions_df)}"
         annotated, topics, embeddings = run_analysis_pipeline(
-            df, force_recompute=force, cache_key=cache_key
+            raw_questions_df,
+            force_recompute=force,
+            cache_key=cache_key,
+            embedder=get_embedder(),
         )
         st.session_state.questions_df = annotated
         st.session_state.topics_df = topics
         st.session_state.embeddings = embeddings
-        st.session_state.subject_materials_df = load_subject_materials()
+        st.session_state.subject_materials_df = st.session_state.subject_materials_raw_df
+        agent_system = get_agent_system()
+        st.session_state.index_sync_counts = agent_system.run_index_corpus(
+            annotated,
+            st.session_state.subject_materials_df,
+            question_embeddings=embeddings,
+        )
         st.session_state.analysis_ready = True
         return True
     except NoQuestionDataError as exc:
@@ -248,6 +339,7 @@ def render_sidebar() -> None:
             "Topic Analysis",
             "Question Predictions",
             "Similarity Search",
+            "Retrieval Evaluation",
             "Analytics Dashboard",
             "Evaluation Metrics",
         ],
@@ -255,25 +347,48 @@ def render_sidebar() -> None:
 
     st.sidebar.divider()
 
+    subject_filter_widget()
+
     if st.sidebar.button("Refresh Analysis"):
         st.session_state.analysis_ready = False
         run_full_analysis(force=True)
         st.sidebar.success("Analysis refreshed.")
 
     if st.sidebar.button("Clear All Uploaded Data", type="secondary"):
-        for path in [QUESTIONS_CSV, SUBJECT_MATERIALS_CSV]:
-            if path.exists():
-                path.unlink()
+        agent_system = get_agent_system()
+        agent_system.vector_store.delete_namespace("past-papers")
+        agent_system.vector_store.delete_namespace("lecture-pdfs")
         st.session_state.analysis_ready = False
+        st.session_state.questions_raw_df = None
+        st.session_state.subject_materials_raw_df = None
         st.session_state.questions_df = None
         st.session_state.topics_df = None
         st.session_state.embeddings = None
+        st.session_state.subject_materials_df = None
         st.session_state.generated_questions = []
         st.sidebar.warning("All uploaded data cleared.")
 
     st.session_state.current_page = page
 
     st.sidebar.divider()
+
+
+@st.cache_resource
+def get_embedder() -> QuestionEmbedder:
+    """Return the single process-wide embedding model instance.
+
+    Streamlit reruns the whole script on every widget interaction, and each
+    browser tab gets its own session_state. Without this cache, every session
+    would load its own ~1.3GB copy of the embedding model concurrently, which
+    is enough concurrent native memory pressure to crash the process.
+    """
+    return QuestionEmbedder()
+
+
+@st.cache_resource
+def get_agent_system() -> ExamAgentSystem:
+    """Return the shared multi-agent orchestration system."""
+    return ExamAgentSystem(embedder=get_embedder())
 
 
 def page_upload_process() -> None:
@@ -315,7 +430,6 @@ def page_upload_process() -> None:
             elif not exam_files:
                 st.error("Please select at least one exam paper PDF.")
             else:
-                RAW_DIR.mkdir(parents=True, exist_ok=True)
                 extractor = PDFExtractor()
                 progress = st.progress(0)
                 processed_frames: list[pd.DataFrame] = []
@@ -323,33 +437,46 @@ def page_upload_process() -> None:
                 ocr_files: list[str] = []
 
                 for idx, uploaded in enumerate(exam_files):
-                    status_msg = f"Processing {uploaded.name}…"
-                    with st.spinner(status_msg):
-                        try:
-                            pdf_path = RAW_DIR / uploaded.name
-                            pdf_path.write_bytes(uploaded.getvalue())
-                            frame = extractor.process_pdf(
-                                pdf_path,
-                                subject=exam_subject.strip(),
-                                year=int(exam_year),
-                            )
-                            processed_frames.append(frame)
-                            if extractor.last_used_ocr:
-                                ocr_files.append(uploaded.name)
-                        except Exception as exc:
-                            logger.exception("PDF processing error: %s", exc)
-                            errors.append(f"{uploaded.name}: {exc}")
+                    temp_path: Path | None = None
+                    try:
+                        safe_name = re.sub(r"[^A-Za-z0-9._ -]+", "_", uploaded.name).strip(" ._") or "uploaded.pdf"
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{safe_name}") as temp_file:
+                            temp_file.write(uploaded.getvalue())
+                            temp_path = Path(temp_file.name)
+                        frame = extractor.process_pdf(
+                            temp_path,
+                            subject=exam_subject.strip(),
+                            year=int(exam_year),
+                        )
+                        processed_frames.append(frame)
+                    except Exception as exc:
+                        logger.exception("PDF processing error: %s", exc)
+                        errors.append(f"{uploaded.name}: {exc}")
+                    finally:
+                        if temp_path is not None and temp_path.exists():
+                            try:
+                                temp_path.unlink()
+                            except Exception:
+                                pass
 
                     progress.progress((idx + 1) / len(exam_files))
 
                 if processed_frames:
                     combined = pd.concat(processed_frames, ignore_index=True)
-                    total = append_questions(combined)
+                    existing = st.session_state.questions_raw_df
+                    if existing is not None and not existing.empty:
+                        combined = pd.concat([existing, combined], ignore_index=True)
+                    combined = combined.drop_duplicates(
+                        subset=["question_text", "year", "subject"],
+                        keep="last",
+                    ).reset_index(drop=True)
+
+                    st.session_state.questions_raw_df = combined
                     st.session_state.analysis_ready = False
                     run_full_analysis(force=True)
                     st.success(
                         f"Extracted {len(combined)} questions for **{exam_subject.strip()}**. "
-                        f"Total questions in library: {len(total)}."
+                        f"Total questions in Pinecone/session: {len(combined)}."
                     )
                     if ocr_files:
                         st.info(
@@ -384,7 +511,6 @@ def page_upload_process() -> None:
             elif not ref_files:
                 st.error("Please select at least one subject PDF.")
             else:
-                RAW_DIR.mkdir(parents=True, exist_ok=True)
                 extractor = PDFExtractor()
                 progress = st.progress(0)
                 material_frames: list[pd.DataFrame] = []
@@ -392,26 +518,44 @@ def page_upload_process() -> None:
                 ocr_ref_files: list[str] = []
 
                 for idx, uploaded in enumerate(ref_files):
-                    with st.spinner(f"Processing {uploaded.name}…"):
-                        try:
-                            pdf_path = RAW_DIR / uploaded.name
-                            pdf_path.write_bytes(uploaded.getvalue())
-                            frame = extractor.process_subject_pdf(
-                                pdf_path, subject=ref_subject.strip()
-                            )
-                            material_frames.append(frame)
-                            if extractor.last_used_ocr:
-                                ocr_ref_files.append(uploaded.name)
-                        except Exception as exc:
-                            logger.exception("Subject PDF error: %s", exc)
-                            errors.append(f"{uploaded.name}: {exc}")
+                    temp_path: Path | None = None
+                    try:
+                        safe_name = re.sub(r"[^A-Za-z0-9._ -]+", "_", uploaded.name).strip(" ._") or "uploaded.pdf"
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{safe_name}") as temp_file:
+                            temp_file.write(uploaded.getvalue())
+                            temp_path = Path(temp_file.name)
+                        frame = extractor.process_subject_pdf(
+                            temp_path, subject=ref_subject.strip()
+                        )
+                        material_frames.append(frame)
+                    except Exception as exc:
+                        logger.exception("Subject PDF error: %s", exc)
+                        errors.append(f"{uploaded.name}: {exc}")
+                    finally:
+                        if temp_path is not None and temp_path.exists():
+                            try:
+                                temp_path.unlink()
+                            except Exception:
+                                pass
 
                     progress.progress((idx + 1) / len(ref_files))
 
                 if material_frames:
                     combined = pd.concat(material_frames, ignore_index=True)
-                    total = append_subject_materials(combined)
-                    st.session_state.subject_materials_df = total
+                    existing = st.session_state.subject_materials_raw_df
+                    if existing is not None and not existing.empty:
+                        combined = pd.concat([existing, combined], ignore_index=True)
+                    if "chunk_id" not in combined.columns:
+                        combined["chunk_id"] = combined["source_file"].astype(str)
+                    combined = combined.drop_duplicates(
+                        subset=["subject", "source_file", "chunk_id"],
+                        keep="last",
+                    ).reset_index(drop=True)
+
+                    st.session_state.subject_materials_raw_df = combined
+                    st.session_state.subject_materials_df = combined
+                    st.session_state.analysis_ready = False
+                    run_full_analysis(force=True)
                     st.success(
                         f"Saved {len(combined)} subject reference document(s) for "
                         f"**{ref_subject.strip()}**."
@@ -516,7 +660,7 @@ def page_topic_analysis() -> None:
 def page_question_predictions() -> None:
     """Render LLM question prediction page."""
     st.title("Question Predictions")
-    st.caption("Requires a valid Gemini API key. Questions are generated from your uploaded exam patterns.")
+    st.caption("Requires a valid Mistral API key. Questions are generated from your uploaded exam patterns.")
 
     if not run_full_analysis():
         return
@@ -537,37 +681,35 @@ def page_question_predictions() -> None:
         topics_df["topic_label"].isin(subject_questions["topic_label"].unique())
     ]
 
+    if subject_topics.empty:
+        st.warning("No discovered topics found for the selected subject yet.")
+        return
+
     topic = st.selectbox("Discovered Topic", subject_topics["topic_label"].tolist())
     num_questions = st.slider("Number of Questions", min_value=1, max_value=10, value=5)
     difficulty = st.radio("Difficulty Level", ["Easy", "Medium", "Hard"], horizontal=True)
 
-    if st.button("Generate Questions with Gemini", type="primary"):
-        if not st.session_state.api_key and not _env_gemini_key():
-            st.error("Gemini API key is required. Enter it in the sidebar or set GEMINI_API_KEY in .env.")
+    if st.button("Generate Questions with Mistral", type="primary"):
+        if not st.session_state.api_key and not _env_mistral_key():
+            st.error("Mistral API key is required. Enter it in the sidebar or set MISTRAL_API_KEY in .env.")
         else:
-            sample = subject_questions[subject_questions["topic_label"] == topic][
-                "question_text"
-            ].tolist()
-            materials_df = (
-                st.session_state.subject_materials_df
-                if st.session_state.subject_materials_df is not None
-                else load_subject_materials()
-            )
-            subject_context = get_subject_context(gen_subject, materials_df)
-
-            generator = QuestionGenerator(
-                api_key=st.session_state.api_key or None,
-            )
             try:
-                with st.spinner("Generating questions via Gemini..."):
-                    generated = generator.generate(
+                with st.spinner("Generating questions via Mistral..."):
+                    agent_system = get_agent_system()
+                    materials_df = (
+                        st.session_state.subject_materials_df
+                        if st.session_state.subject_materials_df is not None
+                        else load_subject_materials()
+                    )
+                    generated = agent_system.generate_questions(
                         topic=topic,
+                        subject=gen_subject,
                         num_questions=num_questions,
                         difficulty=difficulty,
                         strategy=st.session_state.prompt_strategy,
-                        subject=gen_subject,
-                        sample_questions=sample,
-                        subject_material=subject_context or None,
+                        questions_df=questions_df,
+                        topics_df=topics_df,
+                        materials_df=materials_df,
                     )
                 st.session_state.generated_questions = generated
                 st.session_state.gen_topic_for_bleu = topic
@@ -579,15 +721,7 @@ def page_question_predictions() -> None:
     if st.session_state.generated_questions:
         st.subheader(f"Generated Questions — {gen_subject}")
         for idx, item in enumerate(st.session_state.generated_questions, start=1):
-            st.markdown(
-                f"""
-                <div class="question-card">
-                    <strong>Q{idx}. [{item.get('type', 'N/A').upper()} | {item.get('marks', 0)} marks]</strong><br/>
-                    {item.get('question', '')}
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+            st.markdown(render_question_card(idx, item), unsafe_allow_html=True)
 
         gen_df = pd.DataFrame(st.session_state.generated_questions)
         st.download_button(
@@ -619,58 +753,19 @@ def page_question_predictions() -> None:
 
 
 def _env_gemini_key() -> bool:
-    """Check if Gemini API key exists in environment."""
+    """Backward-compatible check for the previous Gemini key name."""
     import os
 
     key = os.getenv("GEMINI_API_KEY", "")
     return bool(key and key not in {"your_gemini_key_here", "your_key_here"})
 
 
-_PREVIEW_CHARS = 220  # characters shown before "show full question" expander
+def _env_mistral_key() -> bool:
+    """Check if a Mistral API key exists in environment."""
+    import os
 
-
-def _display_question(text: str, label: str = "", max_chars: int = _PREVIEW_CHARS) -> None:
-    """Render a single question with spacing repair and a collapsible full-text expander."""
-    cleaned = fix_spacing(str(text))
-    if label:
-        st.markdown(f"**{label}**")
-    if len(cleaned) <= max_chars:
-        st.markdown(cleaned)
-    else:
-        st.markdown(cleaned[:max_chars].rstrip() + " …")
-        with st.expander("Show full question"):
-            st.markdown(cleaned)
-
-
-def _render_dup_card(row: "pd.Series") -> None:
-    """Render one cross-paper duplicate pair as a styled card."""
-    score = float(row["similarity"])
-    score_pct = f"{score:.1%}"
-
-    if score >= 0.97:
-        score_class, badge = "exact", f"EXACT / NEAR-IDENTICAL — {score_pct}"
-    elif score >= 0.90:
-        score_class, badge = "high", f"VERY SIMILAR — {score_pct}"
-    else:
-        score_class, badge = "medium", f"SIMILAR — {score_pct}"
-
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.markdown(
-            f'<p class="dup-paper-label">📄 {row["source_a"]} &nbsp;({row["year_a"]})</p>',
-            unsafe_allow_html=True,
-        )
-        _display_question(row["question_a"])
-    with col_b:
-        st.markdown(
-            f'<p class="dup-paper-label">📄 {row["source_b"]} &nbsp;({row["year_b"]})</p>',
-            unsafe_allow_html=True,
-        )
-        _display_question(row["question_b"])
-    st.markdown(
-        f'<p class="dup-score {score_class}">{badge}</p><hr class="dup-divider"/>',
-        unsafe_allow_html=True,
-    )
+    key = os.getenv("MISTRAL_API_KEY", "")
+    return bool(key and key not in {"your_mistral_key_here", "your_key_here"})
 
 
 def page_similarity_search() -> None:
@@ -684,70 +779,153 @@ def page_similarity_search() -> None:
         st.warning("No data available for the selected subject.")
         return
 
-    tab_query, tab_cross = st.tabs(["Query Search", "Cross-Paper Duplicates"])
+    tab_search, tab_similar = st.tabs(["Search", "Similar Questions Across Papers"])
 
-    # ── Tab 1: query-based search ────────────────────────────────────────────
-    with tab_query:
-        st.write("Type any topic or question to find the closest matches in your uploaded exam papers.")
-        query = st.text_input("Search query", placeholder="e.g. Newton's second law, Dijkstra's algorithm…")
+    with tab_search:
+        query = st.text_input("Enter a topic or question to search your uploaded exam papers")
 
-        if query and st.button("Find Similar Questions", type="primary"):
-            embedder = QuestionEmbedder()
-            query_embedding = embedder.encode([query])[0]
-            scores = embedder.cosine_similarity(query_embedding, embeddings)
-            top_indices = scores.argsort()[::-1][:5]
+        if query and st.button("Find Similar Questions"):
+            agent_system = get_agent_system()
+            materials_df = (
+                st.session_state.subject_materials_df
+                if st.session_state.subject_materials_df is not None
+                else load_subject_materials()
+            )
+            subject_name = st.session_state.selected_subject_filter
+            if subject_name == "All Subjects":
+                subject_name = ""
+
+            retrieval = agent_system.prediction_agent.retrieve_context(
+                query=query,
+                subject=subject_name,
+                questions_df=questions_df,
+                materials_df=materials_df,
+                top_k=5,
+            )
 
             st.subheader("Top 5 Most Similar Past Questions")
-            for rank, local_idx in enumerate(top_indices, start=1):
-                row = questions_df.iloc[local_idx]
-                with st.container():
+            if retrieval.matches.empty:
+                st.info("No Pinecone matches returned yet. Upload more PDFs or check the index configuration.")
+            else:
+                for rank, (_, row) in enumerate(retrieval.matches.head(5).iterrows(), start=1):
                     st.markdown(
                         f"""
                         <div class="question-card">
-                            <strong>#{rank} &nbsp;|&nbsp; Similarity: {scores[local_idx]:.3f}</strong><br/>
-                            <em>📄 {row.get('source_file', '')} &nbsp;|&nbsp;
-                            {row.get('subject', '')} — {row.get('topic_label', 'Unknown Topic')}
-                            &nbsp;({row.get('year', 'N/A')})</em>
+                            <strong>#{rank} | Similarity: {row.get('rerank_score', row.get('score', 0.0)):.3f}</strong><br/>
+                            <em>{row.get('subject', '')} — {row.get('topic_label', 'Unknown Topic')} ({row.get('metadata', {}).get('year', 'N/A')})</em><br/>
+                            {row.get('text', '')}
                         </div>
                         """,
                         unsafe_allow_html=True,
                     )
-                    _display_question(row.get("question_text", ""))
 
-    # ── Tab 2: cross-paper duplicate detection ───────────────────────────────
-    with tab_cross:
-        st.write(
-            "Automatically find questions that appear in **more than one exam paper** — "
-            "identical repeats or paraphrased variants. "
-            "Useful for spotting high-priority topics that examiners reuse across years."
+    with tab_similar:
+        st.caption(
+            "Automatically finds questions that look alike across DIFFERENT uploaded PDFs — "
+            "no search needed. Useful for spotting repeated or recycled questions between papers."
         )
 
-        num_pdfs = (
-            int(questions_df["source_file"].nunique())
-            if "source_file" in questions_df.columns
-            else 0
+        source_count = (
+            questions_df["source_file"].nunique() if "source_file" in questions_df.columns else 0
         )
-
-        if num_pdfs < 2:
-            st.info(
-                "Upload at least **2 exam paper PDFs** to compare them. "
-                "Go to Upload & Process and add more papers."
-            )
+        if source_count < 2:
+            st.info("Upload questions from at least 2 different PDFs to compare across papers.")
         else:
-            st.caption(f"Comparing questions across **{num_pdfs} exam papers**.")
-
             threshold = st.slider(
                 "Similarity threshold",
                 min_value=0.70,
-                max_value=1.00,
+                max_value=0.99,
                 value=0.85,
                 step=0.01,
-                help=(
-                    "0.97–1.00 = exact or near-identical wording | "
-                    "0.90–0.96 = very similar / paraphrased | "
-                    "0.85–0.89 = same concept, different wording"
-                ),
+                help="Higher = only near-identical questions are shown. Lower = also catches "
+                "loosely related questions.",
             )
+
+            evaluator = ExamEvaluator()
+            dup_df = evaluator.find_cross_paper_duplicates(
+                questions_df, embeddings, threshold=threshold
+            )
+
+            if dup_df.empty:
+                st.success(
+                    f"No question pairs found above {threshold:.2f} similarity across "
+                    "different PDFs."
+                )
+            else:
+                pdfs_involved = pd.unique(dup_df[["source_a", "source_b"]].values.ravel())
+                c1, c2 = st.columns(2)
+                c1.metric("Similar question pairs found", len(dup_df))
+                c2.metric("PDFs involved", len(pdfs_involved))
+
+                for _, row in dup_df.iterrows():
+                    st.markdown(
+                        f"""
+                        <div class="question-card">
+                            <strong>Similarity: {row['similarity']:.3f}</strong><br/><br/>
+                            <strong>📄 {row['source_a']}</strong>
+                            <em>({row['subject_a']}, {row['year_a']})</em><br/>
+                            {row['question_a']}<br/><br/>
+                            <strong>📄 {row['source_b']}</strong>
+                            <em>({row['subject_b']}, {row['year_b']})</em><br/>
+                            {row['question_b']}
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+                st.download_button(
+                    "Download similar-question pairs (CSV)",
+                    data=dup_df.to_csv(index=False).encode("utf-8"),
+                    file_name="similar_questions_across_papers.csv",
+                    mime="text/csv",
+                )
+
+
+def page_retrieval_evaluation() -> None:
+    """Render retrieval quality metrics and ranking diagnostics."""
+    st.title("Retrieval Evaluation")
+    if not run_full_analysis():
+        return
+
+    questions_df, _, _ = get_filtered_data()
+    materials_df = (
+        st.session_state.subject_materials_df
+        if st.session_state.subject_materials_df is not None
+        else load_subject_materials()
+    )
+
+    if questions_df.empty:
+        st.warning("No questions available to evaluate retrieval.")
+        return
+
+    subject_name = None if st.session_state.selected_subject_filter == "All Subjects" else st.session_state.selected_subject_filter
+    agent_system = get_agent_system()
+    summary, details = agent_system.evaluate_retrieval(
+        questions_df,
+        materials_df,
+        subject=subject_name,
+        sample_size=25,
+        top_k=5,
+    )
+
+    st.session_state.retrieval_metrics = summary
+    st.session_state.retrieval_details = details
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Precision@5", f"{summary.precision_at_k:.3f}")
+    c2.metric("Recall@5", f"{summary.recall_at_k:.3f}")
+    c3.metric("MRR", f"{summary.mean_reciprocal_rank:.3f}")
+    c4.metric("nDCG@5", f"{summary.ndcg_at_k:.3f}")
+
+    st.caption(f"Evaluated queries: {summary.evaluated_queries}")
+
+    if not details.empty:
+        st.subheader("Sample Retrieval Judgements")
+        st.dataframe(
+            details[["query_question", "retrieved_text", "rank_score", "topic_label", "query_topic", "is_relevant"]],
+            use_container_width=True,
+            hide_index=True,
+        )
 
             if st.button("Find Repeated Questions Across Papers", type="primary"):
                 evaluator = ExamEvaluator()
@@ -1385,6 +1563,7 @@ def main() -> None:
         "Topic Analysis": page_topic_analysis,
         "Question Predictions": page_question_predictions,
         "Similarity Search": page_similarity_search,
+        "Retrieval Evaluation": page_retrieval_evaluation,
         "Analytics Dashboard": page_analytics_dashboard,
         "Evaluation Metrics": page_evaluation_metrics,
     }

@@ -1,0 +1,5 @@
+Streamlit app syntax check passed.
+Found uploaded exam data — run full pipeline test manually after PDF upload.
+NLP pipeline check passed.
+Agent orchestration import passed.
+Validation successful.

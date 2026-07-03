@@ -58,8 +58,22 @@ def load_subject_materials(path: Path | None = None) -> pd.DataFrame:
     """
     csv_path = path or SUBJECT_MATERIALS_CSV
     if not csv_path.exists():
-        return pd.DataFrame(columns=["subject", "source_file", "content_text"])
-    return pd.read_csv(csv_path)
+        return pd.DataFrame(
+            columns=[
+                "subject",
+                "source_file",
+                "page_index",
+                "chunk_id",
+                "content_type",
+                "content_text",
+            ]
+        )
+
+    df = pd.read_csv(csv_path)
+    for column in ["page_index", "chunk_id", "content_type"]:
+        if column not in df.columns:
+            df[column] = pd.NA
+    return df
 
 
 def get_subjects(df: pd.DataFrame) -> list[str]:
@@ -122,6 +136,7 @@ def run_analysis_pipeline(
     df: pd.DataFrame,
     force_recompute: bool = False,
     cache_key: str = "exam_questions",
+    embedder: QuestionEmbedder | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, np.ndarray]:
     """Run NLP enrichment, embedding, and topic clustering pipeline.
 
@@ -132,6 +147,10 @@ def run_analysis_pipeline(
         df: Questions dataframe from uploaded PDFs.
         force_recompute: Force embedding recomputation.
         cache_key: Embedding cache identifier.
+        embedder: Optional shared QuestionEmbedder instance. Callers that run this
+            repeatedly (e.g. a long-lived app process) should pass in one cached
+            instance rather than letting this function load its own copy of the
+            embedding model every call.
 
     Returns:
         Tuple of (annotated questions, topic summary, embeddings).
@@ -142,7 +161,7 @@ def run_analysis_pipeline(
     cleaner = TextCleaner()
     enriched = cleaner.enrich_dataframe(df)
 
-    embedder = QuestionEmbedder()
+    embedder = embedder or QuestionEmbedder()
     embeddings = embedder.encode_dataframe(
         enriched,
         text_column="question_text",
@@ -228,8 +247,11 @@ def append_subject_materials(new_df: pd.DataFrame) -> pd.DataFrame:
     else:
         combined = new_df
 
+    if "chunk_id" not in combined.columns:
+        combined["chunk_id"] = combined["source_file"].astype(str)
+
     combined.drop_duplicates(
-        subset=["subject", "source_file"],
+        subset=["subject", "source_file", "chunk_id"],
         keep="last",
         inplace=True,
     )

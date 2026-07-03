@@ -1,16 +1,16 @@
-"""Extract and segment exam questions from PDF documents."""
+"""Extract and segment exam questions from PDF documents using Mistral OCR."""
 
 from __future__ import annotations
 
 import re
+from pathlib import PurePath
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
-import pdfplumber
+from pypdf import PdfReader
 
-from src.preprocessing.ocr_extractor import extract_text_with_ocr
-from src.preprocessing.text_cleaner import fix_spacing
+from src.ocr.mistral_ocr import MistralOCRClient
 from src.utils import PROCESSED_DIR, setup_logging
 
 logger = setup_logging(__name__)
@@ -35,7 +35,7 @@ PAGE_NUMBER_PATTERN = re.compile(r"^\s*\d{1,4}\s*$", re.MULTILINE)
 
 
 class PDFExtractor:
-    """Extract exam questions from PDF files and persist them as CSV."""
+    """Extract exam questions and lecture notes from PDFs via Mistral OCR."""
 
     def __init__(self, output_dir: Path | None = None) -> None:
         """Initialize the PDF extractor.
@@ -45,70 +45,65 @@ class PDFExtractor:
         """
         self.output_dir = output_dir or PROCESSED_DIR
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self._last_used_ocr: bool = False
+        self.ocr_client = MistralOCRClient()
 
-    @property
-    def last_used_ocr(self) -> bool:
-        """True if the most recent extraction used OCR (scanned PDF)."""
-        return self._last_used_ocr
+    @staticmethod
+    def _read_local_pdf_pages(pdf_path: Path) -> list[dict[str, Any]]:
+        """Extract page text locally before using OCR."""
+        reader = PdfReader(str(pdf_path))
+        pages: list[dict[str, Any]] = []
+        for index, page in enumerate(reader.pages):
+            text = (page.extract_text() or "").strip()
+            if not text:
+                continue
+            pages.append(
+                {
+                    "page_index": index,
+                    "content_text": text,
+                    "raw_page": None,
+                    "source": "pypdf",
+                }
+            )
+        return pages
 
-    def extract_text_from_pdf(self, pdf_path: Path, use_ocr: bool = True) -> str:
-        """Extract raw text from a PDF file, falling back to OCR if needed.
-
-        First attempts fast pdfplumber text extraction.  If the result is too
-        short (image-based / scanned PDF), and ``use_ocr`` is True, falls back
-        to EasyOCR page-by-page scanning.
+    def extract_text_from_pdf(self, pdf_path: Path) -> str:
+        """Extract OCR text from a PDF file.
 
         Args:
             pdf_path: Path to the PDF file.
             use_ocr: Allow OCR fallback for scanned PDFs.
 
         Returns:
-            Extracted text content.
+            Combined OCR text content.
 
         Raises:
-            ValueError: If text cannot be extracted even with OCR.
+            ValueError: If the OCR request fails or the PDF yields no readable text.
         """
         if not pdf_path.exists():
             raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
-        self._last_used_ocr = False
-        text_parts: list[str] = []
-        pdfplumber_ok = True
+        try:
+            local_pages = self._read_local_pdf_pages(pdf_path)
+            local_text = "\n\n".join(chunk["content_text"] for chunk in local_pages if chunk.get("content_text")).strip()
+            if len(local_text) >= 20:
+                logger.info("Using local PDF text extraction for %s", pdf_path.name)
+                return local_text
+        except Exception as exc:
+            logger.debug("Local PDF extraction failed for %s: %s", pdf_path, exc)
 
         try:
-            with pdfplumber.open(pdf_path) as pdf:
-                if not pdf.pages:
-                    raise ValueError("PDF contains no pages.")
-                for page in pdf.pages:
-                    page_text = page.extract_text() or ""
-                    if page_text.strip():
-                        text_parts.append(page_text)
+            page_chunks = self.ocr_client.document_to_pages(pdf_path)
         except Exception as exc:
-            logger.warning(
-                "pdfplumber could not read '%s': %s — will try OCR", pdf_path.name, exc
-            )
-            pdfplumber_ok = False
-
-        combined = "\n".join(text_parts).strip()
-
-        if len(combined) >= 20:
-            return combined
-
-        # Insufficient text — this is a scanned / image-based PDF
-        if not use_ocr:
+            logger.exception("Failed to OCR PDF: %s", pdf_path)
             raise ValueError(
-                f"PDF '{pdf_path.name}' appears to be image-based and OCR is disabled."
-            )
+                f"Unable to read PDF '{pdf_path.name}'. Check your Mistral API key, file contents, or upload path."
+            ) from exc
 
-        logger.info(
-            "pdfplumber extracted only %d chars from '%s' — switching to OCR",
-            len(combined),
-            pdf_path.name,
-        )
-        ocr_text = extract_text_with_ocr(pdf_path)
-        self._last_used_ocr = True
-        return ocr_text
+        text_parts = [chunk["content_text"] for chunk in page_chunks if chunk.get("content_text")]
+        combined = "\n\n".join(text_parts).strip()
+        if len(combined) < 20:
+            raise ValueError(f"PDF '{pdf_path.name}' appears to contain insufficient readable text.")
+        return combined
 
     def clean_text(self, text: str) -> str:
         """Remove headers, footers, and page numbers from extracted text.
@@ -174,6 +169,10 @@ class PDFExtractor:
             )
         return questions
 
+    @staticmethod
+    def _build_chunk_id(pdf_path: Path, page_index: int) -> str:
+        return f"{pdf_path.stem}_page_{page_index + 1:03d}"
+
     def _extract_marks(self, text: str) -> int | None:
         """Extract marks allocation from question text.
 
@@ -228,7 +227,7 @@ class PDFExtractor:
                     "subject": subject,
                     "marks": item.get("marks"),
                     "source_file": pdf_path.name,
-                    "extraction_method": extraction_method,
+                    "content_type": "past-paper",
                 }
             )
         return pd.DataFrame(records)
@@ -302,15 +301,37 @@ class PDFExtractor:
         Returns:
             DataFrame with subject reference content.
         """
-        raw_text = self.extract_text_from_pdf(pdf_path, use_ocr=use_ocr)
-        cleaned_text = self.clean_text(raw_text)
-        return pd.DataFrame(
-            [
+        try:
+            page_chunks = self._read_local_pdf_pages(pdf_path)
+            if not page_chunks:
+                page_chunks = self.ocr_client.document_to_pages(pdf_path)
+        except Exception as exc:
+            logger.exception("Failed to OCR subject PDF: %s", pdf_path)
+            raise ValueError(
+                f"Unable to read subject PDF '{pdf_path.name}'. Check your Mistral API key, file contents, or upload path."
+            ) from exc
+
+        records = []
+        for chunk in page_chunks:
+            cleaned_text = self.clean_text(chunk["content_text"])
+            if not cleaned_text:
+                continue
+            page_index = int(chunk.get("page_index", 0))
+            records.append(
                 {
                     "subject": subject.strip(),
                     "source_file": pdf_path.name,
+                    "page_index": page_index,
+                    "chunk_id": self._build_chunk_id(pdf_path, page_index),
+                    "content_type": "lecture-pdf",
                     "content_text": cleaned_text,
                     "extraction_method": "ocr" if self._last_used_ocr else "text",
                 }
-            ]
-        )
+            )
+
+        if not records:
+            raise ValueError(
+                f"No readable OCR chunks were produced from '{pdf_path.name}'."
+            )
+
+        return pd.DataFrame(records)
