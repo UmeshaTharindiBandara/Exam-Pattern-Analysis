@@ -25,54 +25,54 @@ This project satisfies the assignment's "minimum three techniques" requirement w
 | 1 | **NLP — text pre/post-processing** | `src/preprocessing/`, `src/classification/topic_classifier.py`: OCR text cleaning, tokenization, stopword removal, lemmatization, question segmentation |
 | 2 | **Transformer-based models** | `src/embeddings/embedder.py` (BGE sentence embeddings), `src/retrieval/reranker.py` (cross-encoder reranking), `src/classification/bert_classifier.py` (zero-shot DistilBERT classification) |
 | 3 | **Prompt engineering** | `src/generation/question_generator.py`: three selectable strategies — direct, chain-of-thought, and context-aware (retrieval-grounded) prompting for the Mistral LLM |
-| 4 (bonus) | **Retrieval-Augmented Generation** | `src/retrieval/pinecone_store.py` + reranker feed retrieved context into generation, evaluated quantitatively (see §6) |
+| 4 | **Retrieval-Augmented Generation** | `src/retrieval/pinecone_store.py` + reranker feed retrieved context into generation, evaluated quantitatively (see §6) |
 
 ---
 
 ## 3. System Architecture
 
 ```
-                 ┌─────────────────────┐
- PDF Upload ───▶ │   Mistral OCR /      │
+                  ┌─────────────────────┐
+ PDF Upload ───▶ │   Mistral OCR /     │
  (past papers,   │   pdfplumber/pypdf   │
  lecture notes)  │   extraction         │
                  └──────────┬───────────┘
                             ▼
                  ┌─────────────────────┐
-                 │  Text Cleaning &     │
-                 │  Question Segment.   │  (src/preprocessing)
-                 └──────────┬───────────┘
+                 │  Text Cleaning &    │
+                 │  Question Segment.  │  (src/preprocessing)
+                 └──────────┬──────────┘
                             ▼
                  ┌─────────────────────┐
-                 │  Sentence Embeddings │  (BAAI/bge-large-en-v1.5)
-                 └──────────┬───────────┘
+                 │  Sentence Embeddings│  (BAAI/bge-large-en-v1.5)
+                 └──────────┬──────────┘
                             ▼
         ┌───────────────────┴────────────────────┐
-        ▼                                         ▼
+        ▼                                        ▼
 ┌───────────────────┐                   ┌───────────────────────┐
-│ KMeans Topic        │                   │ Pinecone Vector Index  │
-│ Clustering           │                   │ (semantic retrieval)   │
-│ (dynamic, no fixed   │                   └───────────┬────────────┘
-│ topic list)          │                               ▼
-└──────────┬──────────┘                   ┌───────────────────────┐
-           │                               │ Cross-Encoder Reranker │
-           │                               └───────────┬────────────┘
-           ▼                                            ▼
+│ KMeans Topic      │                   │ Pinecone Vector Index │
+│ Clustering        │                   │ (semantic retrieval)  │
+│ (dynamic, no fixed│                   └───────────┬───────────┘
+│ topic list)       │                               ▼
+└──────────┬────────┘                   ┌───────────────────────┐
+           │                            │ Cross-Encoder Reranker│
+           │                            └───────────┬───────────┘
+           ▼                                        ▼
 ┌────────────────────────────────────────────────────────────────┐
-│           Multi-Agent Workflow (LangGraph-style)                 │
-│  PastPaperAgent → LecturePdfAgent → PredictionAgent → Eval Agent  │
-└──────────────────────────────┬───────────────────────────────────┘
-                                 ▼
+│           Multi-Agent Workflow (LangGraph-style)               │
+│ PastPaperAgent → LecturePdfAgent → PredictionAgent → Eval Agent│
+└──────────────────────────────┬─────────────────────────────────┘
+                               ▼
                     ┌────────────────────────┐
-                    │ Mistral LLM              │
-                    │ (question generation,    │
-                    │  prompt-engineered)       │
-                    └───────────┬───────────────┘
-                                 ▼
+                    │ Mistral LLM            │
+                    │ (question generation,  │
+                    │  prompt-engineered)    │
+                    └───────────┬────────────┘
+                                ▼
                     ┌────────────────────────┐
-                    │ Streamlit Dashboard      │
-                    │ (topics, predictions,    │
-                    │  evaluation, export)      │
+                    │ Streamlit Dashboard    │
+                    │ (topics, predictions,  │
+                    │  evaluation, export)   │
                     └────────────────────────┘
 ```
 
