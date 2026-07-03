@@ -1,9 +1,13 @@
-"""Multi-agent orchestration for exam paper analysis and prediction."""
+"""Multi-agent orchestration for exam paper analysis and prediction.
+
+The app now exposes a LangGraph-style workflow wrapper while keeping the existing
+agent classes and imperative fallback intact for compatibility.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypedDict
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -17,6 +21,13 @@ from src.retrieval.pinecone_store import PineconeVectorStore
 from src.retrieval.reranker import QuestionReranker
 from src.utils import setup_logging
 
+try:
+    from langgraph.graph import END, START, StateGraph
+except ImportError:  # pragma: no cover - optional dependency
+    END = None
+    START = None
+    StateGraph = None
+
 load_dotenv()
 logger = setup_logging(__name__)
 
@@ -28,6 +39,27 @@ class RetrievalBundle:
     matches: pd.DataFrame
     sample_questions: list[str]
     subject_context: str
+
+
+class ExamWorkflowState(TypedDict, total=False):
+    """State passed between workflow nodes."""
+
+    mode: str
+    questions_df: pd.DataFrame
+    materials_df: pd.DataFrame
+    question_embeddings: Any
+    subject: str
+    topic: str
+    num_questions: int
+    difficulty: str
+    strategy: str
+    top_k: int
+    sample_size: int
+    retrieval: RetrievalBundle
+    generated_questions: list[dict[str, Any]]
+    evaluation_summary: RetrievalMetricSummary
+    evaluation_details: pd.DataFrame
+    index_sync_counts: dict[str, int]
 
 
 class PastPaperAgent:
@@ -147,6 +179,27 @@ class PredictionAgent:
         )
         return generated
 
+    def generate_from_bundle(
+        self,
+        *,
+        topic: str,
+        subject: str,
+        num_questions: int,
+        difficulty: str,
+        strategy: str,
+        retrieval: RetrievalBundle,
+    ) -> list[dict[str, Any]]:
+        """Generate questions from a precomputed retrieval bundle."""
+        return self.generator.generate(
+            topic=topic,
+            num_questions=num_questions,
+            difficulty=difficulty,  # type: ignore[arg-type]
+            strategy=strategy,  # type: ignore[arg-type]
+            subject=subject,
+            sample_questions=retrieval.sample_questions,
+            subject_material=retrieval.subject_context or None,
+        )
+
 
 class EvaluationAgent:
     """Run retrieval evaluation over the indexed corpus."""
@@ -230,6 +283,200 @@ class ExamAgentSystem:
             generator=self.generator,
         )
         self.evaluation_agent = EvaluationAgent(self.prediction_agent)
+        self._workflow = self._build_workflow()
+
+    def _build_workflow(self):
+        """Build a LangGraph workflow when the dependency is available."""
+        if StateGraph is None or START is None or END is None:
+            return None
+
+        workflow = StateGraph(ExamWorkflowState)
+        workflow.add_node("route", self._route_node)
+        workflow.add_node("index", self._index_node)
+        workflow.add_node("retrieve", self._retrieve_node)
+        workflow.add_node("generate", self._generate_node)
+        workflow.add_node("evaluate", self._evaluate_node)
+
+        workflow.add_edge(START, "route")
+        workflow.add_conditional_edges(
+            "route",
+            self._route_decision,
+            {
+                "index": "index",
+                "generate": "retrieve",
+                "evaluate": "evaluate",
+            },
+        )
+        workflow.add_edge("index", END)
+        workflow.add_edge("retrieve", "generate")
+        workflow.add_edge("generate", END)
+        workflow.add_edge("evaluate", END)
+        return workflow.compile()
+
+    @staticmethod
+    def _route_node(state: ExamWorkflowState) -> dict[str, Any]:
+        return {}
+
+    @staticmethod
+    def _route_decision(state: ExamWorkflowState) -> str:
+        return str(state.get("mode", "generate"))
+
+    def _index_node(self, state: ExamWorkflowState) -> dict[str, Any]:
+        questions_df = state.get("questions_df", pd.DataFrame())
+        materials_df = state.get("materials_df", pd.DataFrame())
+        question_embeddings = state.get("question_embeddings")
+        return {
+            "index_sync_counts": self.index_corpus(
+                questions_df,
+                materials_df,
+                question_embeddings=question_embeddings,
+            )
+        }
+
+    def _retrieve_node(self, state: ExamWorkflowState) -> dict[str, Any]:
+        retrieval = self.prediction_agent.retrieve_context(
+            query=str(state.get("topic", "")),
+            subject=str(state.get("subject", "")),
+            questions_df=state.get("questions_df", pd.DataFrame()),
+            materials_df=state.get("materials_df", pd.DataFrame()),
+            top_k=int(state.get("top_k", 8)),
+        )
+        return {"retrieval": retrieval}
+
+    def _generate_node(self, state: ExamWorkflowState) -> dict[str, Any]:
+        retrieval = state.get("retrieval")
+        if retrieval is None:
+            retrieval = RetrievalBundle(
+                matches=pd.DataFrame(),
+                sample_questions=[],
+                subject_context="",
+            )
+
+        generated = self.prediction_agent.generate_from_bundle(
+            topic=str(state.get("topic", "")),
+            subject=str(state.get("subject", "")),
+            num_questions=int(state.get("num_questions", 5)),
+            difficulty=str(state.get("difficulty", "Medium")),
+            strategy=str(state.get("strategy", "context_aware")),
+            retrieval=retrieval,
+        )
+        return {"generated_questions": generated}
+
+    def _evaluate_node(self, state: ExamWorkflowState) -> dict[str, Any]:
+        summary, details = self.evaluation_agent.evaluate_retrieval(
+            state.get("questions_df", pd.DataFrame()),
+            state.get("materials_df", pd.DataFrame()),
+            subject=state.get("subject") or None,
+            sample_size=int(state.get("sample_size", 25)),
+            top_k=int(state.get("top_k", 5)),
+        )
+        return {"evaluation_summary": summary, "evaluation_details": details}
+
+    def _invoke_workflow(self, state: ExamWorkflowState) -> ExamWorkflowState:
+        if self._workflow is None:
+            return state
+        result = self._workflow.invoke(state)
+        if isinstance(result, dict):
+            return result
+        return state
+
+    def run_index_corpus(
+        self,
+        questions_df: pd.DataFrame,
+        materials_df: pd.DataFrame,
+        *,
+        question_embeddings=None,
+    ) -> dict[str, int]:
+        """Run corpus indexing through the workflow when available."""
+        if self._workflow is None:
+            return self.index_corpus(
+                questions_df,
+                materials_df,
+                question_embeddings=question_embeddings,
+            )
+
+        result = self._invoke_workflow(
+            {
+                "mode": "index",
+                "questions_df": questions_df,
+                "materials_df": materials_df,
+                "question_embeddings": question_embeddings,
+            }
+        )
+        return result.get("index_sync_counts", {"questions": 0, "materials": 0})
+
+    def generate_questions(
+        self,
+        *,
+        topic: str,
+        subject: str,
+        num_questions: int,
+        difficulty: str,
+        strategy: str,
+        questions_df: pd.DataFrame,
+        topics_df: pd.DataFrame,
+        materials_df: pd.DataFrame,
+    ) -> list[dict[str, Any]]:
+        """Generate questions via the workflow when available."""
+        if self._workflow is None:
+            return self.prediction_agent.generate(
+                topic=topic,
+                subject=subject,
+                num_questions=num_questions,
+                difficulty=difficulty,
+                strategy=strategy,
+                questions_df=questions_df,
+                topics_df=topics_df,
+                materials_df=materials_df,
+            )
+
+        result = self._invoke_workflow(
+            {
+                "mode": "generate",
+                "topic": topic,
+                "subject": subject,
+                "num_questions": num_questions,
+                "difficulty": difficulty,
+                "strategy": strategy,
+                "questions_df": questions_df,
+                "materials_df": materials_df,
+            }
+        )
+        return result.get("generated_questions", [])
+
+    def evaluate_retrieval(
+        self,
+        questions_df: pd.DataFrame,
+        materials_df: pd.DataFrame,
+        *,
+        subject: str | None = None,
+        sample_size: int = 25,
+        top_k: int = 5,
+    ) -> tuple[RetrievalMetricSummary, pd.DataFrame]:
+        """Evaluate retrieval via the workflow when available."""
+        if self._workflow is None:
+            return self.evaluation_agent.evaluate_retrieval(
+                questions_df,
+                materials_df,
+                subject=subject,
+                sample_size=sample_size,
+                top_k=top_k,
+            )
+
+        result = self._invoke_workflow(
+            {
+                "mode": "evaluate",
+                "subject": subject or "",
+                "questions_df": questions_df,
+                "materials_df": materials_df,
+                "sample_size": sample_size,
+                "top_k": top_k,
+            }
+        )
+        return (
+            result.get("evaluation_summary", RetrievalMetricSummary(0.0, 0.0, 0.0, 0.0, 0)),
+            result.get("evaluation_details", pd.DataFrame()),
+        )
 
     def index_corpus(
         self,

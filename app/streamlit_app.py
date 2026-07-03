@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import re
+import tempfile
 import sys
 from pathlib import Path
 
@@ -20,19 +23,13 @@ from src.embeddings.embedder import QuestionEmbedder
 from src.evaluation.evaluator import ExamEvaluator
 from src.pipeline import (
     NoQuestionDataError,
-    QUESTIONS_CSV,
-    SUBJECT_MATERIALS_CSV,
-    append_questions,
-    append_subject_materials,
     filter_by_subject,
     get_subject_context,
     get_subjects,
-    load_questions,
-    load_subject_materials,
     run_analysis_pipeline,
 )
 from src.preprocessing.pdf_extractor import PDFExtractor
-from src.utils import PROCESSED_DIR, RAW_DIR, setup_logging
+from src.utils import setup_logging
 
 logger = setup_logging("streamlit_app")
 
@@ -186,6 +183,8 @@ def render_question_card(idx: int, item: dict) -> str:
 def init_session_state() -> None:
     """Initialize Streamlit session state variables."""
     defaults = {
+        "questions_raw_df": None,
+        "subject_materials_raw_df": None,
         "questions_df": None,
         "topics_df": None,
         "embeddings": None,
@@ -216,18 +215,26 @@ def run_full_analysis(force: bool = False) -> bool:
     if st.session_state.analysis_ready and not force:
         return st.session_state.questions_df is not None
 
+    raw_questions_df = st.session_state.questions_raw_df
+    if raw_questions_df is None or raw_questions_df.empty:
+        st.info("Upload past exam PDFs to begin analysis.")
+        st.session_state.analysis_ready = False
+        return False
+
     try:
-        df = load_questions()
-        cache_key = f"exam_questions_{len(df)}"
+        cache_key = f"exam_questions_{len(raw_questions_df)}"
         annotated, topics, embeddings = run_analysis_pipeline(
-            df, force_recompute=force, cache_key=cache_key, embedder=get_embedder()
+            raw_questions_df,
+            force_recompute=force,
+            cache_key=cache_key,
+            embedder=get_embedder(),
         )
         st.session_state.questions_df = annotated
         st.session_state.topics_df = topics
         st.session_state.embeddings = embeddings
-        st.session_state.subject_materials_df = load_subject_materials()
+        st.session_state.subject_materials_df = st.session_state.subject_materials_raw_df
         agent_system = get_agent_system()
-        st.session_state.index_sync_counts = agent_system.index_corpus(
+        st.session_state.index_sync_counts = agent_system.run_index_corpus(
             annotated,
             st.session_state.subject_materials_df,
             question_embeddings=embeddings,
@@ -312,13 +319,13 @@ def render_sidebar() -> None:
         agent_system = get_agent_system()
         agent_system.vector_store.delete_namespace("past-papers")
         agent_system.vector_store.delete_namespace("lecture-pdfs")
-        for path in [QUESTIONS_CSV, SUBJECT_MATERIALS_CSV]:
-            if path.exists():
-                path.unlink()
         st.session_state.analysis_ready = False
+        st.session_state.questions_raw_df = None
+        st.session_state.subject_materials_raw_df = None
         st.session_state.questions_df = None
         st.session_state.topics_df = None
         st.session_state.embeddings = None
+        st.session_state.subject_materials_df = None
         st.session_state.generated_questions = []
         st.sidebar.warning("All uploaded data cleared.")
 
@@ -384,18 +391,20 @@ def page_upload_process() -> None:
             elif not exam_files:
                 st.error("Please select at least one exam paper PDF.")
             else:
-                RAW_DIR.mkdir(parents=True, exist_ok=True)
                 extractor = PDFExtractor()
                 progress = st.progress(0)
                 processed_frames: list[pd.DataFrame] = []
                 errors: list[str] = []
 
                 for idx, uploaded in enumerate(exam_files):
+                    temp_path: Path | None = None
                     try:
-                        pdf_path = RAW_DIR / uploaded.name
-                        pdf_path.write_bytes(uploaded.getvalue())
+                        safe_name = re.sub(r"[^A-Za-z0-9._ -]+", "_", uploaded.name).strip(" ._") or "uploaded.pdf"
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{safe_name}") as temp_file:
+                            temp_file.write(uploaded.getvalue())
+                            temp_path = Path(temp_file.name)
                         frame = extractor.process_pdf(
-                            pdf_path,
+                            temp_path,
                             subject=exam_subject.strip(),
                             year=int(exam_year),
                         )
@@ -403,17 +412,31 @@ def page_upload_process() -> None:
                     except Exception as exc:
                         logger.exception("PDF processing error: %s", exc)
                         errors.append(f"{uploaded.name}: {exc}")
+                    finally:
+                        if temp_path is not None and temp_path.exists():
+                            try:
+                                temp_path.unlink()
+                            except Exception:
+                                pass
 
                     progress.progress((idx + 1) / len(exam_files))
 
                 if processed_frames:
                     combined = pd.concat(processed_frames, ignore_index=True)
-                    total = append_questions(combined)
+                    existing = st.session_state.questions_raw_df
+                    if existing is not None and not existing.empty:
+                        combined = pd.concat([existing, combined], ignore_index=True)
+                    combined = combined.drop_duplicates(
+                        subset=["question_text", "year", "subject"],
+                        keep="last",
+                    ).reset_index(drop=True)
+
+                    st.session_state.questions_raw_df = combined
                     st.session_state.analysis_ready = False
                     run_full_analysis(force=True)
                     st.success(
                         f"Extracted {len(combined)} questions for **{exam_subject.strip()}**. "
-                        f"Total questions in library: {len(total)}."
+                        f"Total questions in Pinecone/session: {len(combined)}."
                     )
 
                 for err in errors:
@@ -443,30 +466,48 @@ def page_upload_process() -> None:
             elif not ref_files:
                 st.error("Please select at least one subject PDF.")
             else:
-                RAW_DIR.mkdir(parents=True, exist_ok=True)
                 extractor = PDFExtractor()
                 progress = st.progress(0)
                 material_frames: list[pd.DataFrame] = []
                 errors: list[str] = []
 
                 for idx, uploaded in enumerate(ref_files):
+                    temp_path: Path | None = None
                     try:
-                        pdf_path = RAW_DIR / uploaded.name
-                        pdf_path.write_bytes(uploaded.getvalue())
+                        safe_name = re.sub(r"[^A-Za-z0-9._ -]+", "_", uploaded.name).strip(" ._") or "uploaded.pdf"
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{safe_name}") as temp_file:
+                            temp_file.write(uploaded.getvalue())
+                            temp_path = Path(temp_file.name)
                         frame = extractor.process_subject_pdf(
-                            pdf_path, subject=ref_subject.strip()
+                            temp_path, subject=ref_subject.strip()
                         )
                         material_frames.append(frame)
                     except Exception as exc:
                         logger.exception("Subject PDF error: %s", exc)
                         errors.append(f"{uploaded.name}: {exc}")
+                    finally:
+                        if temp_path is not None and temp_path.exists():
+                            try:
+                                temp_path.unlink()
+                            except Exception:
+                                pass
 
                     progress.progress((idx + 1) / len(ref_files))
 
                 if material_frames:
                     combined = pd.concat(material_frames, ignore_index=True)
-                    total = append_subject_materials(combined)
-                    st.session_state.subject_materials_df = total
+                    existing = st.session_state.subject_materials_raw_df
+                    if existing is not None and not existing.empty:
+                        combined = pd.concat([existing, combined], ignore_index=True)
+                    if "chunk_id" not in combined.columns:
+                        combined["chunk_id"] = combined["source_file"].astype(str)
+                    combined = combined.drop_duplicates(
+                        subset=["subject", "source_file", "chunk_id"],
+                        keep="last",
+                    ).reset_index(drop=True)
+
+                    st.session_state.subject_materials_raw_df = combined
+                    st.session_state.subject_materials_df = combined
                     st.session_state.analysis_ready = False
                     run_full_analysis(force=True)
                     st.success(
@@ -609,12 +650,12 @@ def page_question_predictions() -> None:
                         if st.session_state.subject_materials_df is not None
                         else load_subject_materials()
                     )
-                    generated = agent_system.prediction_agent.generate(
+                    generated = agent_system.generate_questions(
                         topic=topic,
+                        subject=gen_subject,
                         num_questions=num_questions,
                         difficulty=difficulty,
                         strategy=st.session_state.prompt_strategy,
-                        subject=gen_subject,
                         questions_df=questions_df,
                         topics_df=topics_df,
                         materials_df=materials_df,
@@ -806,7 +847,7 @@ def page_retrieval_evaluation() -> None:
 
     subject_name = None if st.session_state.selected_subject_filter == "All Subjects" else st.session_state.selected_subject_filter
     agent_system = get_agent_system()
-    summary, details = agent_system.evaluation_agent.evaluate_retrieval(
+    summary, details = agent_system.evaluate_retrieval(
         questions_df,
         materials_df,
         subject=subject_name,

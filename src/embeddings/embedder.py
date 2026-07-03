@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Iterable
 
 import numpy as np
 import pandas as pd
+
+os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+os.environ.setdefault("USE_TF", "0")
+
 from sentence_transformers import SentenceTransformer
 
 from src.utils import PROCESSED_DIR, setup_logging

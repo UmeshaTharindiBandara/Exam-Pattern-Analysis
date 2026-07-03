@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import re
+from pathlib import PurePath
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from pypdf import PdfReader
 
 from src.ocr.mistral_ocr import MistralOCRClient
 from src.utils import PROCESSED_DIR, setup_logging
@@ -45,6 +47,25 @@ class PDFExtractor:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.ocr_client = MistralOCRClient()
 
+    @staticmethod
+    def _read_local_pdf_pages(pdf_path: Path) -> list[dict[str, Any]]:
+        """Extract page text locally before using OCR."""
+        reader = PdfReader(str(pdf_path))
+        pages: list[dict[str, Any]] = []
+        for index, page in enumerate(reader.pages):
+            text = (page.extract_text() or "").strip()
+            if not text:
+                continue
+            pages.append(
+                {
+                    "page_index": index,
+                    "content_text": text,
+                    "raw_page": None,
+                    "source": "pypdf",
+                }
+            )
+        return pages
+
     def extract_text_from_pdf(self, pdf_path: Path) -> str:
         """Extract OCR text from a PDF file.
 
@@ -61,19 +82,26 @@ class PDFExtractor:
             raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
         try:
+            local_pages = self._read_local_pdf_pages(pdf_path)
+            local_text = "\n\n".join(chunk["content_text"] for chunk in local_pages if chunk.get("content_text")).strip()
+            if len(local_text) >= 20:
+                logger.info("Using local PDF text extraction for %s", pdf_path.name)
+                return local_text
+        except Exception as exc:
+            logger.debug("Local PDF extraction failed for %s: %s", pdf_path, exc)
+
+        try:
             page_chunks = self.ocr_client.document_to_pages(pdf_path)
         except Exception as exc:
             logger.exception("Failed to OCR PDF: %s", pdf_path)
             raise ValueError(
-                f"Unable to OCR PDF '{pdf_path.name}'. Check your Mistral API key or file contents."
+                f"Unable to read PDF '{pdf_path.name}'. Check your Mistral API key, file contents, or upload path."
             ) from exc
 
         text_parts = [chunk["content_text"] for chunk in page_chunks if chunk.get("content_text")]
         combined = "\n\n".join(text_parts).strip()
         if len(combined) < 20:
-            raise ValueError(
-                f"PDF '{pdf_path.name}' appears to contain insufficient readable OCR text."
-            )
+            raise ValueError(f"PDF '{pdf_path.name}' appears to contain insufficient readable text.")
         return combined
 
     def clean_text(self, text: str) -> str:
@@ -266,11 +294,13 @@ class PDFExtractor:
             DataFrame with subject reference content.
         """
         try:
-            page_chunks = self.ocr_client.document_to_pages(pdf_path)
+            page_chunks = self._read_local_pdf_pages(pdf_path)
+            if not page_chunks:
+                page_chunks = self.ocr_client.document_to_pages(pdf_path)
         except Exception as exc:
             logger.exception("Failed to OCR subject PDF: %s", pdf_path)
             raise ValueError(
-                f"Unable to OCR subject PDF '{pdf_path.name}'. Check your Mistral API key or file contents."
+                f"Unable to read subject PDF '{pdf_path.name}'. Check your Mistral API key, file contents, or upload path."
             ) from exc
 
         records = []

@@ -9,6 +9,8 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+from pypdf import PdfReader
+
 from src.utils import setup_logging
 
 load_dotenv()
@@ -103,21 +105,56 @@ class MistralOCRClient:
 
     def document_to_pages(self, pdf_path: Path) -> list[dict[str, Any]]:
         """Return normalized OCR page payloads for a PDF."""
-        response = self.process_pdf(pdf_path)
-        pages = getattr(response, "pages", None)
-        if pages is None and isinstance(response, dict):
-            pages = response.get("pages", [])
+        try:
+            response = self.process_pdf(pdf_path)
+            pages = getattr(response, "pages", None)
+            if pages is None and isinstance(response, dict):
+                pages = response.get("pages", [])
 
-        normalized: list[dict[str, Any]] = []
-        for index, page in enumerate(pages or []):
-            text = self.page_to_text(page)
+            normalized: list[dict[str, Any]] = []
+            for index, page in enumerate(pages or []):
+                text = self.page_to_text(page)
+                if not text:
+                    continue
+                normalized.append(
+                    {
+                        "page_index": index,
+                        "content_text": text,
+                        "raw_page": page,
+                    }
+                )
+
+            if normalized:
+                return normalized
+
+            logger.warning(
+                "Mistral OCR returned no readable pages for %s; using local PDF text extraction.",
+                pdf_path.name,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Mistral OCR failed for %s (%s); using local PDF text extraction.",
+                pdf_path.name,
+                exc,
+            )
+
+        try:
+            reader = PdfReader(str(pdf_path))
+        except Exception as exc:
+            raise ValueError(f"Unable to read PDF '{pdf_path.name}' with a local fallback.") from exc
+
+        fallback_pages: list[dict[str, Any]] = []
+        for index, page in enumerate(reader.pages):
+            text = (page.extract_text() or "").strip()
             if not text:
                 continue
-            normalized.append(
+            fallback_pages.append(
                 {
                     "page_index": index,
                     "content_text": text,
-                    "raw_page": page,
+                    "raw_page": None,
+                    "source": "pypdf",
                 }
             )
-        return normalized
+
+        return fallback_pages

@@ -1,6 +1,6 @@
 # AI-Powered Exam Pattern Analysis and Question Prediction System
 
-Analyze **your own** past examination papers using Mistral OCR, Pinecone vector retrieval, reranking, and multi-agent orchestration to discover question patterns, identify important topics, and generate probable future exam questions.
+Analyze **your own** past examination papers using Mistral OCR, Pinecone vector retrieval, reranking, and a LangGraph-style multi-agent workflow to discover question patterns, identify important topics, and generate probable future exam questions.
 
 > **No sample CSV data.** All analysis comes from PDFs you upload. Subjects are fully dynamic — enter any subject name (e.g. Physics, Law, Nursing, Finance).
 
@@ -10,14 +10,14 @@ Analyze **your own** past examination papers using Mistral OCR, Pinecone vector 
 - **Subject PDF Upload** — Add syllabus, notes, or textbook PDFs as Mistral OCR context
 - **Dynamic Topic Discovery** — KMeans clustering on your exam content (no predefined topics)
 - **Retrieval-Augmented Prediction** — Pinecone stores embeddings and reranking improves retrieval quality
-- **Multi-Agent Layout** — Separate past-paper, lecture-pdf, prediction, and evaluation agents
+- **LangGraph-Style Workflow** — Separate past-paper, lecture-pdf, prediction, and evaluation agents coordinated in one graph
 - **Mistral Question Generation** — Mistral chat completions generate new questions from your patterns
 - **Multi-Subject Support** — Upload papers for multiple subjects and filter analysis
 - **Interactive Dashboard** — Topic charts, similarity search, retrieval evaluation, analytics, CSV/PDF export
 
 ## Tech Stack
 
-- Python 3.12+, Streamlit, Mistral API, Pinecone
+- Python 3.12+, Streamlit, LangGraph, Mistral API, Pinecone
 - Sentence Transformers, Scikit-learn, NLTK
 - Plotly, Pandas, Mistral OCR, cross-encoder reranking
 
@@ -76,13 +76,14 @@ streamlit run app\streamlit_app.py
 3. Past-paper PDFs become question rows; lecture PDFs become chunk rows.
 4. Sentence embeddings are created and stored in Pinecone.
 5. Retrieval pulls the most relevant chunks, then a cross-encoder reranks them.
-6. The prediction agent sends the reranked context into Mistral chat completions.
+6. The workflow routes into retrieval, reranking, and Mistral chat completions.
 7. Evaluation metrics measure retrieval quality from the indexed corpus.
 
 ##  API Key
 
-Required for **Question Predictions**. Provide via:
-- `API_KEY` in `.env`
+Required runtime keys:
+- `MISTRAL_API_KEY` for OCR and question generation
+- `PINECONE_API_KEY` and `PINECONE_INDEX_NAME` for retrieval
 
 ## PDF Tips
 
@@ -97,7 +98,7 @@ exam-pattern-analysis/
 ├── data/raw/              # Uploaded PDFs saved here
 ├── data/processed/        # questions.csv, subject_materials.csv
 ├── app/streamlit_app.py   # Main dashboard
-├── src/                   # NLP, clustering, OpenAI generation
+├── src/                   # NLP, clustering, retrieval, generation, workflow agents
 └── scripts/               # Utility scripts
 ```
 
@@ -112,6 +113,18 @@ When you select a topic and generate questions, the system:
 2. Retrieves the top-K most similar chunks from Pinecone
 3. Reranks them using a cross-encoder model
 4. Feeds the reranked context into Mistral for question generation
+
+### Agent Workflow
+
+The app keeps the agent logic in a single Python process, but the control flow is organized like a LangGraph pipeline:
+
+1. `PastPaperAgent` ingests past exam PDFs into question rows.
+2. `LecturePdfAgent` ingests syllabus/notes PDFs into reference chunks.
+3. `ExamAgentSystem` indexes both corpora into Pinecone.
+4. `PredictionAgent` retrieves context, reranks results, and prepares generation inputs.
+5. `EvaluationAgent` reuses the retrieval path to compute ranking metrics.
+
+If `langgraph` is installed, the workflow wrapper in `src/agents/exam_agents.py` routes these steps through a graph object; otherwise the app falls back to the same imperative Python calls.
 
 The evaluation metrics measure the **quality of steps 2–3** — how relevant and well-ordered the retrieved results are.
 
