@@ -36,6 +36,7 @@ class TopicClassifier:
         self.random_state = random_state
         self.cluster_model: KMeans | None = None
         self.optimal_k: int = min_clusters
+        self.best_silhouette_score: float = 0.0
 
     def find_optimal_clusters(self, embeddings: np.ndarray) -> int:
         """Select optimal cluster count using silhouette score.
@@ -69,6 +70,7 @@ class TopicClassifier:
                 best_k = k
 
         self.optimal_k = best_k
+        self.best_silhouette_score = best_score
         logger.info("Selected %s clusters (silhouette=%.3f)", best_k, best_score)
         return best_k
 

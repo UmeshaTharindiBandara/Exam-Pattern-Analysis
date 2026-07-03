@@ -169,8 +169,11 @@ def run_analysis_pipeline(
         force_recompute=force_recompute,
     )
 
-    max_k = min(10, max(2, len(enriched) - 1))
-    min_k = min(3, max(1, len(enriched) - 1))
+    n = len(enriched)
+    # Require at least ~4 questions per cluster so silhouette is meaningful.
+    # n//4 ensures each cluster has enough members; floor at 2, cap at 10.
+    max_k = min(10, max(2, n // 4))
+    min_k = min(3, max(2, n // 6))
     classifier = TopicClassifier(min_clusters=min_k, max_clusters=max_k)
     annotated, summary = classifier.annotate_questions(enriched, embeddings)
     summary = classifier.identify_trends(summary)

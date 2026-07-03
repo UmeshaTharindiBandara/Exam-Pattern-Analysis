@@ -120,6 +120,44 @@ THEME_CSS = """
     [data-testid="stDataFrame"] th {
         font-weight: 600 !important;
     }
+
+    /* Cross-paper duplicate pair cards */
+    .dup-card {
+        border: 1px solid #c5d5f5;
+        border-radius: 10px;
+        padding: 14px 18px;
+        margin-bottom: 14px;
+        background-color: #f7f9ff;
+    }
+    html[data-theme="dark"] .dup-card,
+    [data-testid="stAppViewContainer"][class*="dark"] .dup-card {
+        background-color: #1a2340;
+        border-color: #2e4a8a;
+    }
+    .dup-score {
+        font-size: 0.78rem;
+        font-weight: 700;
+        letter-spacing: 0.03em;
+        margin-bottom: 10px;
+    }
+    .dup-score.exact  { color: #d62728; }
+    .dup-score.high   { color: #e07b00; }
+    .dup-score.medium { color: #1f77b4; }
+    .dup-paper-label {
+        font-size: 0.82rem;
+        font-weight: 600;
+        margin-bottom: 4px;
+        color: #4f8ef7;
+    }
+    .dup-q {
+        font-size: 0.93rem;
+        line-height: 1.5;
+    }
+    .dup-divider {
+        border: none;
+        border-top: 1px dashed rgba(100,116,139,0.3);
+        margin: 6px 0 10px 0;
+    }
 </style>
 """
 st.markdown(THEME_CSS, unsafe_allow_html=True)
@@ -303,6 +341,7 @@ def render_sidebar() -> None:
             "Similarity Search",
             "Retrieval Evaluation",
             "Analytics Dashboard",
+            "Evaluation Metrics",
         ],
     )
 
@@ -395,6 +434,7 @@ def page_upload_process() -> None:
                 progress = st.progress(0)
                 processed_frames: list[pd.DataFrame] = []
                 errors: list[str] = []
+                ocr_files: list[str] = []
 
                 for idx, uploaded in enumerate(exam_files):
                     temp_path: Path | None = None
@@ -438,6 +478,11 @@ def page_upload_process() -> None:
                         f"Extracted {len(combined)} questions for **{exam_subject.strip()}**. "
                         f"Total questions in Pinecone/session: {len(combined)}."
                     )
+                    if ocr_files:
+                        st.info(
+                            f"**OCR was used** for {len(ocr_files)} scanned PDF(s): "
+                            + ", ".join(ocr_files)
+                        )
 
                 for err in errors:
                     st.error(err)
@@ -470,6 +515,7 @@ def page_upload_process() -> None:
                 progress = st.progress(0)
                 material_frames: list[pd.DataFrame] = []
                 errors: list[str] = []
+                ocr_ref_files: list[str] = []
 
                 for idx, uploaded in enumerate(ref_files):
                     temp_path: Path | None = None
@@ -514,6 +560,11 @@ def page_upload_process() -> None:
                         f"Saved {len(combined)} subject reference document(s) for "
                         f"**{ref_subject.strip()}**."
                     )
+                    if ocr_ref_files:
+                        st.info(
+                            f"**OCR was used** for {len(ocr_ref_files)} scanned PDF(s): "
+                            + ", ".join(ocr_ref_files)
+                        )
 
                 for err in errors:
                     st.error(err)
@@ -661,6 +712,8 @@ def page_question_predictions() -> None:
                         materials_df=materials_df,
                     )
                 st.session_state.generated_questions = generated
+                st.session_state.gen_topic_for_bleu = topic
+                st.session_state.gen_subject_for_bleu = gen_subject
             except Exception as exc:
                 logger.exception("Generation failed: %s", exc)
                 st.error(f"Generation failed: {exc}")
@@ -874,6 +927,64 @@ def page_retrieval_evaluation() -> None:
             hide_index=True,
         )
 
+            if st.button("Find Repeated Questions Across Papers", type="primary"):
+                evaluator = ExamEvaluator()
+                with st.spinner("Computing pairwise similarity across all papers…"):
+                    pairs_df = evaluator.find_cross_paper_duplicates(
+                        questions_df, embeddings, threshold=threshold
+                    )
+
+                if pairs_df.empty:
+                    st.info(
+                        f"No question pairs found above **{threshold:.0%}** similarity. "
+                        "Try lowering the threshold."
+                    )
+                else:
+                    n_pairs = len(pairs_df)
+                    pdf_pairs = (
+                        pairs_df[["source_a", "source_b"]]
+                        .drop_duplicates()
+                        .shape[0]
+                    )
+                    exact_count = int((pairs_df["similarity"] >= 0.97).sum())
+                    high_count = int(
+                        ((pairs_df["similarity"] >= 0.90) & (pairs_df["similarity"] < 0.97)).sum()
+                    )
+
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Similar Pairs Found", n_pairs)
+                    m2.metric("PDF Pairs Compared", pdf_pairs)
+                    m3.metric("Exact / Near-Identical", exact_count)
+                    m4.metric("Very Similar", high_count)
+
+                    # CSV export
+                    export_cols = [
+                        "similarity", "source_a", "year_a", "question_a",
+                        "source_b", "year_b", "question_b",
+                    ]
+                    st.download_button(
+                        "Download Results as CSV",
+                        data=pairs_df[export_cols].to_csv(index=False).encode("utf-8"),
+                        file_name="cross_paper_duplicates.csv",
+                        mime="text/csv",
+                    )
+
+                    st.divider()
+
+                    # Group by PDF pair and show expanders
+                    grouped = pairs_df.groupby(["source_a", "source_b"], sort=False)
+                    for (src_a, src_b), group in grouped:
+                        n = len(group)
+                        exact_in_group = int((group["similarity"] >= 0.97).sum())
+                        label = (
+                            f"📄 {src_a}  ↔  📄 {src_b} "
+                            f"— {n} match{'es' if n != 1 else ''}"
+                            + (f"  ({exact_in_group} exact)" if exact_in_group else "")
+                        )
+                        with st.expander(label, expanded=(n_pairs <= 20)):
+                            for _, pair_row in group.iterrows():
+                                _render_dup_card(pair_row)
+
 
 def page_analytics_dashboard() -> None:
     """Render analytics overview dashboard."""
@@ -922,6 +1033,525 @@ def page_analytics_dashboard() -> None:
     )
 
 
+def _silhouette_label(score: float) -> tuple[str, str]:
+    """Return (emoji+text, colour) interpretation for a silhouette score."""
+    if score >= 0.70:
+        return "Strong clustering — topics are well separated", "normal"
+    if score >= 0.50:
+        return "Reasonable clustering — moderate topic overlap", "normal"
+    if score >= 0.25:
+        return "Weak clustering — topics overlap significantly", "off"
+    return "Poor clustering — consider uploading more questions", "inverse"
+
+
+def _compute_tsne(questions_df: pd.DataFrame, embeddings) -> pd.DataFrame:
+    """Project embeddings to 2D via t-SNE and return a plot-ready DataFrame."""
+    from sklearn.manifold import TSNE
+
+    n = len(embeddings)
+    perplexity = min(30, max(5, (n - 1) // 4))
+    coords = TSNE(
+        n_components=2,
+        random_state=42,
+        perplexity=perplexity,
+        max_iter=1000,
+        init="pca",
+        learning_rate="auto",
+    ).fit_transform(embeddings)
+
+    q = questions_df.reset_index(drop=True)
+    return pd.DataFrame({
+        "x": coords[:, 0].round(3),
+        "y": coords[:, 1].round(3),
+        "topic_label": q.get("topic_label", pd.Series(["Unknown"] * n)).fillna("Unknown").values,
+        "year": q.get("year", pd.Series(["N/A"] * n)).astype(str).values,
+        "subject": q.get("subject", pd.Series([""] * n)).astype(str).values,
+        "question_preview": q["question_text"].astype(str).str[:100].values,
+    })
+
+
+def _compute_bleu_rouge(
+    generated_questions: list,
+    reference_questions: list[str],
+) -> pd.DataFrame:
+    """Return BLEU-1, BLEU-2, ROUGE-1, ROUGE-L per generated question."""
+    if not generated_questions or not reference_questions:
+        return pd.DataFrame()
+    try:
+        from nltk.tokenize import word_tokenize
+        from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
+    except ImportError:
+        return pd.DataFrame()
+
+    smoother = SmoothingFunction().method1
+    ref_tokens = [word_tokenize(q.lower()) for q in reference_questions if q.strip()]
+
+    rouge_scorer_obj = None
+    try:
+        from rouge_score import rouge_scorer as _rs
+        rouge_scorer_obj = _rs.RougeScorer(["rouge1", "rougeL"], use_stemmer=True)
+    except ImportError:
+        pass
+
+    rows = []
+    for item in generated_questions:
+        gen_text = str(item.get("question", "")).strip()
+        if not gen_text:
+            continue
+        hyp_tokens = word_tokenize(gen_text.lower())
+        b1 = sentence_bleu(ref_tokens, hyp_tokens, weights=(1, 0, 0, 0), smoothing_function=smoother)
+        b2 = sentence_bleu(ref_tokens, hyp_tokens, weights=(0.5, 0.5, 0, 0), smoothing_function=smoother)
+        row = {
+            "Question": gen_text[:110] + ("…" if len(gen_text) > 110 else ""),
+            "Type": item.get("type", ""),
+            "Difficulty": item.get("difficulty", ""),
+            "BLEU-1": round(b1, 4),
+            "BLEU-2": round(b2, 4),
+        }
+        if rouge_scorer_obj is not None:
+            best_r1 = best_rL = 0.0
+            for ref in reference_questions[:30]:
+                r = rouge_scorer_obj.score(ref, gen_text)
+                if r["rouge1"].fmeasure > best_r1:
+                    best_r1 = r["rouge1"].fmeasure
+                    best_rL = r["rougeL"].fmeasure
+            row["ROUGE-1"] = round(best_r1, 4)
+            row["ROUGE-L"] = round(best_rL, 4)
+        rows.append(row)
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
+def _compute_tfidf_evaluation(questions_df: pd.DataFrame) -> dict:
+    """Compute TF-IDF vectors, cluster them, and return evaluation data.
+
+    Returns a dict with keys:
+        silhouette_score, n_clusters, top_terms_per_topic, tfidf_matrix
+    """
+    import numpy as np
+    from sklearn.cluster import KMeans
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics import silhouette_score
+    from sklearn.metrics.pairwise import cosine_similarity
+
+    texts = questions_df["question_text"].fillna("").tolist()
+    n = len(texts)
+    if n < 4:
+        return {}
+
+    vectorizer = TfidfVectorizer(
+        max_features=500,
+        stop_words="english",
+        ngram_range=(1, 2),
+        min_df=1,
+    )
+    tfidf_matrix = vectorizer.fit_transform(texts)
+    feature_names = vectorizer.get_feature_names_out()
+
+    # Use same cluster-count formula as the main pipeline
+    max_k = min(10, max(2, n // 4))
+    min_k = min(3, max(2, n // 6))
+
+    best_k, best_score, best_labels = min_k, -1.0, None
+    for k in range(min_k, max_k + 1):
+        km = KMeans(n_clusters=k, random_state=42, n_init=10)
+        labels = km.fit_predict(tfidf_matrix)
+        if len(set(labels)) < 2:
+            continue
+        score = silhouette_score(tfidf_matrix, labels, metric="cosine")
+        if score > best_score:
+            best_score, best_k, best_labels = score, k, labels
+
+    # Top TF-IDF terms per cluster
+    top_terms: dict[int, list[str]] = {}
+    if best_labels is not None:
+        for cluster_id in sorted(set(best_labels)):
+            mask = best_labels == cluster_id
+            cluster_matrix = tfidf_matrix[mask]
+            mean_tfidf = cluster_matrix.mean(axis=0).A1
+            top_idx = mean_tfidf.argsort()[::-1][:5]
+            top_terms[int(cluster_id)] = [feature_names[i] for i in top_idx]
+
+    # Cosine similarity distribution (sample up to 200 pairs)
+    dense = tfidf_matrix.toarray()
+    sim_matrix = cosine_similarity(dense)
+    upper = sim_matrix[np.triu_indices(n, k=1)]
+
+    return {
+        "silhouette_score": round(float(best_score), 4),
+        "n_clusters": best_k,
+        "top_terms_per_topic": top_terms,
+        "similarity_distribution": upper.tolist(),
+        "labels": best_labels,
+    }
+
+
+def _get_tsne_cached(questions_df: pd.DataFrame, embeddings) -> pd.DataFrame:
+    """Return t-SNE DataFrame, cached in session_state to avoid recomputing."""
+    cache_key = f"_tsne_{len(questions_df)}_{embeddings.shape[0]}"
+    if cache_key not in st.session_state:
+        st.session_state[cache_key] = _compute_tsne(questions_df, embeddings)
+    return st.session_state[cache_key]
+
+
+def page_evaluation_metrics() -> None:
+    """Render evaluation and performance metrics page."""
+    st.title("Evaluation Metrics")
+    st.caption(
+        "Quantitative assessment of clustering quality, embedding structure, "
+        "and generated question similarity."
+    )
+
+    if not run_full_analysis():
+        return
+
+    questions_df, topics_df, embeddings = get_filtered_data()
+    if questions_df.empty or embeddings is None:
+        st.warning("No data available for the selected subject filter.")
+        return
+
+    tab_cluster, tab_tsne, tab_bleu, tab_embed = st.tabs([
+        "Clustering Quality",
+        "Embedding Visualisation (t-SNE)",
+        "Generation Quality (BLEU / ROUGE)",
+        "Embedding Comparison (TF-IDF vs Sentence)",
+    ])
+
+    # ── Tab 1: Clustering Quality ────────────────────────────────────────────
+    with tab_cluster:
+        st.subheader("KMeans Clustering Quality")
+
+        sil_score = float(st.session_state.get("silhouette_score", 0.0))
+
+        # Recompute if filtered view differs from full dataset
+        if "topic_id" in questions_df.columns and len(set(questions_df["topic_id"])) >= 2:
+            from sklearn.metrics import silhouette_score as _sil
+            try:
+                sil_score = float(_sil(embeddings, questions_df["topic_id"].values))
+            except Exception:
+                pass
+
+        interp, delta_color = _silhouette_label(sil_score)
+        n_topics = int(topics_df["topic_label"].nunique()) if not topics_df.empty else 0
+        avg_q = int(len(questions_df) / n_topics) if n_topics else 0
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Silhouette Score", f"{sil_score:.4f}", delta=interp, delta_color=delta_color)
+        c2.metric("Topics (Clusters)", n_topics)
+        c3.metric("Avg Questions / Topic", avg_q)
+
+        st.info(
+            "**Silhouette Score** ranges from -1 to 1.  "
+            "Values above **0.50** indicate well-separated topic clusters.  "
+            "This score was maximised automatically over 3–10 clusters using the "
+            "silhouette criterion during the KMeans fitting step."
+        )
+
+        st.divider()
+        st.subheader("Topic-level Breakdown")
+        if not topics_df.empty:
+            display = topics_df[["topic_label", "question_count", "trend"]].copy()
+            display["% of questions"] = (
+                display["question_count"] / display["question_count"].sum() * 100
+            ).round(1).astype(str) + "%"
+            st.dataframe(display, use_container_width=True, hide_index=True)
+
+            # Bar chart: topic sizes
+            fig = px.bar(
+                display.sort_values("question_count", ascending=True),
+                x="question_count",
+                y="topic_label",
+                orientation="h",
+                title="Questions per Topic",
+                labels={"question_count": "Questions", "topic_label": "Topic"},
+                template="plotly_dark",
+            )
+            fig.update_layout(margin=dict(l=10, r=10, t=40, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+
+    # ── Tab 2: t-SNE Embedding Visualisation ────────────────────────────────
+    with tab_tsne:
+        st.subheader("Question Embedding Space — t-SNE Projection")
+        st.write(
+            "Each dot is one exam question projected from a 384-dimensional semantic "
+            "embedding to 2D.  Questions that cluster together share similar meaning.  "
+            "Colours represent the automatically discovered topic groups."
+        )
+        st.caption(
+            "Note: t-SNE preserves local neighbourhood structure, not global distances.  "
+            "Cluster sizes and inter-cluster distances are not directly comparable."
+        )
+
+        n = len(embeddings)
+        if n < 6:
+            st.warning("At least 6 questions are needed for a meaningful t-SNE plot.")
+        else:
+            if st.button("Generate t-SNE Plot", type="primary"):
+                with st.spinner(f"Projecting {n} questions to 2D — this may take ~10s…"):
+                    tsne_df = _get_tsne_cached(questions_df, embeddings)
+
+                fig = px.scatter(
+                    tsne_df,
+                    x="x",
+                    y="y",
+                    color="topic_label",
+                    hover_data={"x": False, "y": False,
+                                "question_preview": True, "year": True, "subject": True},
+                    title="Question Embeddings — t-SNE 2D",
+                    template="plotly_dark",
+                    labels={"topic_label": "Topic", "question_preview": "Question"},
+                )
+                fig.update_traces(marker=dict(size=7, opacity=0.8))
+                fig.update_layout(
+                    margin=dict(l=10, r=10, t=50, b=10),
+                    legend=dict(orientation="v", x=1.01, y=0.5),
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+                # Download t-SNE data
+                st.download_button(
+                    "Download t-SNE Coordinates (CSV)",
+                    data=tsne_df.to_csv(index=False).encode("utf-8"),
+                    file_name="tsne_embeddings.csv",
+                    mime="text/csv",
+                )
+            else:
+                st.info("Click **Generate t-SNE Plot** above to visualise the embedding space.")
+
+    # ── Tab 3: BLEU / ROUGE ─────────────────────────────────────────────────
+    with tab_bleu:
+        st.subheader("Generated Question Quality — BLEU & ROUGE")
+        st.write(
+            "Measures how closely the **Gemini-generated** questions resemble real past "
+            "exam questions in vocabulary and phrasing.  "
+            "Go to **Question Predictions**, generate questions, then return here."
+        )
+        st.info(
+            "**Interpreting scores:** BLEU and ROUGE measure n-gram overlap with "
+            "reference questions.  For question *generation*, moderate scores "
+            "**(0.10–0.40)** are ideal — they show the questions follow exam style "
+            "without being verbatim copies.  Very high scores (>0.60) would indicate "
+            "repetition; very low scores (<0.05) may mean off-topic output."
+        )
+
+        generated = st.session_state.get("generated_questions", [])
+        gen_topic = st.session_state.get("gen_topic_for_bleu", "")
+        gen_subject = st.session_state.get("gen_subject_for_bleu", "")
+
+        if not generated:
+            st.warning("No generated questions yet. Go to **Question Predictions** and generate some first.")
+        else:
+            # Build reference corpus from same topic/subject
+            ref_df = questions_df.copy()
+            all_refs = ref_df["question_text"].dropna().tolist()
+            if gen_topic:
+                topic_refs = ref_df[ref_df["topic_label"] == gen_topic]["question_text"].tolist()
+                # Need ≥10 topic questions for BLEU to be meaningful; fall back to full corpus.
+                reference_questions = topic_refs if len(topic_refs) >= 10 else all_refs
+            else:
+                reference_questions = all_refs
+
+            st.caption(
+                f"Comparing **{len(generated)} generated question(s)** against "
+                f"**{len(reference_questions)} reference question(s)** "
+                f"from topic: *{gen_topic or 'all'}* / subject: *{gen_subject or 'all'}*."
+            )
+
+            with st.spinner("Computing BLEU & ROUGE scores…"):
+                scores_df = _compute_bleu_rouge(generated, reference_questions)
+
+            if scores_df.empty:
+                st.error("Could not compute scores. Ensure NLTK data is downloaded.")
+            else:
+                score_cols = [c for c in ["BLEU-1", "BLEU-2", "ROUGE-1", "ROUGE-L"] if c in scores_df.columns]
+
+                # Summary metrics row
+                avg = scores_df[score_cols].mean()
+                cols = st.columns(len(score_cols))
+                for col, metric in zip(cols, score_cols):
+                    col.metric(f"Avg {metric}", f"{avg[metric]:.4f}")
+
+                st.divider()
+                st.dataframe(
+                    scores_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Question": st.column_config.TextColumn(width="large"),
+                        "BLEU-1": st.column_config.ProgressColumn(min_value=0, max_value=1, format="%.4f"),
+                        "BLEU-2": st.column_config.ProgressColumn(min_value=0, max_value=1, format="%.4f"),
+                        "ROUGE-1": st.column_config.ProgressColumn(min_value=0, max_value=1, format="%.4f"),
+                        "ROUGE-L": st.column_config.ProgressColumn(min_value=0, max_value=1, format="%.4f"),
+                    },
+                )
+
+                st.download_button(
+                    "Download Scores as CSV",
+                    data=scores_df.to_csv(index=False).encode("utf-8"),
+                    file_name="bleu_rouge_scores.csv",
+                    mime="text/csv",
+                )
+
+    # ── Tab 4: Embedding Comparison ──────────────────────────────────────────
+    with tab_embed:
+        st.subheader("Embedding Method Comparison: TF-IDF vs Sentence Transformers")
+        st.write(
+            "Compares two fundamentally different ways of turning exam questions into "
+            "vectors.  **TF-IDF** uses word frequency statistics (fast, interpretable).  "
+            "**Sentence Transformers** (`all-MiniLM-L6-v2`) use deep learning to capture "
+            "semantic meaning even when different words express the same idea."
+        )
+
+        if st.button("Run Embedding Comparison", type="primary"):
+            with st.spinner("Computing TF-IDF vectors and clustering…"):
+                tfidf_result = _compute_tfidf_evaluation(questions_df)
+
+            if not tfidf_result:
+                st.warning("Need at least 4 questions to compare embedding methods.")
+            else:
+                # ── Silhouette comparison ────────────────────────────────────
+                st.subheader("Clustering Quality — Silhouette Score")
+
+                sil_sent = 0.0
+                if "topic_id" in questions_df.columns and len(set(questions_df["topic_id"])) >= 2:
+                    from sklearn.metrics import silhouette_score as _sil
+                    try:
+                        sil_sent = float(_sil(embeddings, questions_df["topic_id"].values))
+                    except Exception:
+                        pass
+
+                sil_tfidf = tfidf_result["silhouette_score"]
+                n_clust_tfidf = tfidf_result["n_clusters"]
+                n_clust_sent = int(questions_df["topic_id"].nunique()) if "topic_id" in questions_df.columns else 0
+
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.metric(
+                        "Sentence Transformer Silhouette",
+                        f"{sil_sent:.4f}",
+                        delta=f"{n_clust_sent} clusters",
+                        delta_color="off",
+                    )
+                with c2:
+                    st.metric(
+                        "TF-IDF Silhouette",
+                        f"{sil_tfidf:.4f}",
+                        delta=f"{n_clust_tfidf} clusters",
+                        delta_color="off",
+                    )
+
+                # Bar chart comparison
+                cmp_df = pd.DataFrame({
+                    "Method": ["TF-IDF", "Sentence Transformer"],
+                    "Silhouette Score": [sil_tfidf, sil_sent],
+                    "Clusters": [n_clust_tfidf, n_clust_sent],
+                })
+                fig_cmp = px.bar(
+                    cmp_df,
+                    x="Method",
+                    y="Silhouette Score",
+                    color="Method",
+                    text="Silhouette Score",
+                    title="Silhouette Score: TF-IDF vs Sentence Transformer",
+                    template="plotly_dark",
+                    color_discrete_map={
+                        "TF-IDF": "#f4a261",
+                        "Sentence Transformer": "#4cc9f0",
+                    },
+                )
+                fig_cmp.update_traces(texttemplate="%{text:.4f}", textposition="outside")
+                fig_cmp.update_layout(
+                    yaxis=dict(range=[0, 1]),
+                    showlegend=False,
+                    margin=dict(l=10, r=10, t=50, b=10),
+                )
+                st.plotly_chart(fig_cmp, use_container_width=True)
+
+                # Interpretation
+                winner = "Sentence Transformer" if sil_sent >= sil_tfidf else "TF-IDF"
+                diff = abs(sil_sent - sil_tfidf)
+                if diff < 0.02:
+                    interp = "Both methods produce **similar clustering quality** on your dataset."
+                elif winner == "Sentence Transformer":
+                    interp = (
+                        f"**Sentence Transformer wins** by {diff:.4f} — it captures semantic "
+                        "similarity better (e.g. 'compute the hash' and 'find the digest' cluster "
+                        "together even though the words differ)."
+                    )
+                else:
+                    interp = (
+                        f"**TF-IDF wins** by {diff:.4f} — your questions use very consistent "
+                        "keyword patterns so word-frequency statistics are sufficient."
+                    )
+                st.info(interp)
+
+                st.divider()
+
+                # ── Top TF-IDF terms per topic ───────────────────────────────
+                st.subheader("Top TF-IDF Keywords per Topic")
+                st.caption(
+                    "These are the highest-weighted terms for each topic cluster "
+                    "discovered by TF-IDF vectorization — useful for interpreting "
+                    "what each cluster is actually about."
+                )
+                top_terms = tfidf_result.get("top_terms_per_topic", {})
+                if top_terms:
+                    term_rows = [
+                        {"Topic": f"Topic {tid + 1}", "Top Keywords": " · ".join(terms)}
+                        for tid, terms in sorted(top_terms.items())
+                    ]
+                    st.dataframe(
+                        pd.DataFrame(term_rows),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                st.divider()
+
+                # ── Cosine similarity distribution ───────────────────────────
+                st.subheader("Pairwise Cosine Similarity Distribution")
+                st.caption(
+                    "Shows how similar questions are to each other under each method.  "
+                    "A tighter distribution near 0 means questions are well-separated; "
+                    "a peak near 1 means many questions are very similar."
+                )
+                sim_vals = tfidf_result.get("similarity_distribution", [])
+                if sim_vals:
+                    import numpy as np
+                    sim_df = pd.DataFrame({
+                        "Cosine Similarity": sim_vals,
+                        "Method": ["TF-IDF"] * len(sim_vals),
+                    })
+                    fig_hist = px.histogram(
+                        sim_df,
+                        x="Cosine Similarity",
+                        nbins=40,
+                        title="TF-IDF Pairwise Similarity Distribution",
+                        template="plotly_dark",
+                        color_discrete_sequence=["#f4a261"],
+                    )
+                    fig_hist.update_layout(margin=dict(l=10, r=10, t=50, b=10))
+                    st.plotly_chart(fig_hist, use_container_width=True)
+
+                    st.caption(
+                        f"Median similarity: **{float(np.median(sim_vals)):.4f}** | "
+                        f"Max: **{float(np.max(sim_vals)):.4f}** | "
+                        f"Pairs above 0.85: **{sum(1 for s in sim_vals if s >= 0.85)}**"
+                    )
+
+                # Download comparison summary
+                st.download_button(
+                    "Download Comparison Summary (CSV)",
+                    data=cmp_df.to_csv(index=False).encode("utf-8"),
+                    file_name="embedding_comparison.csv",
+                    mime="text/csv",
+                )
+        else:
+            st.info(
+                "Click **Run Embedding Comparison** to vectorise your questions with TF-IDF "
+                "and compare against the Sentence Transformer embeddings."
+            )
+
+
 def main() -> None:
     """Main Streamlit application entry point."""
     init_session_state()
@@ -935,6 +1565,7 @@ def main() -> None:
         "Similarity Search": page_similarity_search,
         "Retrieval Evaluation": page_retrieval_evaluation,
         "Analytics Dashboard": page_analytics_dashboard,
+        "Evaluation Metrics": page_evaluation_metrics,
     }
     pages[page]()
 

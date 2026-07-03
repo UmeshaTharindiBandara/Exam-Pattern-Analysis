@@ -71,6 +71,7 @@ class PDFExtractor:
 
         Args:
             pdf_path: Path to the PDF file.
+            use_ocr: Allow OCR fallback for scanned PDFs.
 
         Returns:
             Combined OCR text content.
@@ -122,7 +123,7 @@ class PDFExtractor:
             if HEADER_FOOTER_PATTERN.search(stripped) and len(stripped.split()) <= 8:
                 continue
             lines.append(stripped)
-        return "\n".join(lines)
+        return fix_spacing("\n".join(lines))
 
     def segment_questions(self, text: str) -> list[dict[str, Any]]:
         """Segment cleaned text into individual questions.
@@ -191,6 +192,7 @@ class PDFExtractor:
         pdf_path: Path,
         subject: str,
         year: int,
+        use_ocr: bool = True,
     ) -> pd.DataFrame:
         """Extract, clean, segment, and structure questions from a PDF.
 
@@ -198,11 +200,13 @@ class PDFExtractor:
             pdf_path: Path to uploaded PDF.
             subject: Subject name for the exam paper.
             year: Exam year.
+            use_ocr: Allow OCR fallback for scanned/image-based PDFs.
 
         Returns:
-            DataFrame with question records.
+            DataFrame with question records.  Includes an ``extraction_method``
+            column ("text" for direct extraction, "ocr" for scanned PDFs).
         """
-        raw_text = self.extract_text_from_pdf(pdf_path)
+        raw_text = self.extract_text_from_pdf(pdf_path, use_ocr=use_ocr)
         cleaned_text = self.clean_text(raw_text)
         segmented = self.segment_questions(cleaned_text)
 
@@ -212,6 +216,7 @@ class PDFExtractor:
                 "Try a text-based PDF with numbered questions."
             )
 
+        extraction_method = "ocr" if self._last_used_ocr else "text"
         records = []
         for idx, item in enumerate(segmented, start=1):
             records.append(
@@ -283,12 +288,15 @@ class PDFExtractor:
         combined.to_csv(output_path, index=False)
         return combined
 
-    def process_subject_pdf(self, pdf_path: Path, subject: str) -> pd.DataFrame:
+    def process_subject_pdf(
+        self, pdf_path: Path, subject: str, use_ocr: bool = True
+    ) -> pd.DataFrame:
         """Extract reference text from a subject/syllabus PDF.
 
         Args:
             pdf_path: Path to subject material PDF.
             subject: User-defined subject name (any discipline).
+            use_ocr: Allow OCR fallback for scanned PDFs.
 
         Returns:
             DataFrame with subject reference content.
@@ -317,6 +325,7 @@ class PDFExtractor:
                     "chunk_id": self._build_chunk_id(pdf_path, page_index),
                     "content_type": "lecture-pdf",
                     "content_text": cleaned_text,
+                    "extraction_method": "ocr" if self._last_used_ocr else "text",
                 }
             )
 
