@@ -1,38 +1,178 @@
-# AI-Powered Exam Pattern Analysis and Question Prediction System
+# Multi-Agent-Based AI-Powered Exam Pattern Analysis and Question Prediction System
 
-Analyze **your own** past examination papers using Mistral OCR, Pinecone vector retrieval, reranking, and a LangGraph-style multi-agent workflow to discover question patterns, identify important topics, and generate probable future exam questions.
+**Advanced Artificial Intelligence — Group Project**
 
-> **No sample CSV data.** All analysis comes from PDFs you upload. Subjects are fully dynamic — enter any subject name (e.g. Physics, Law, Nursing, Finance).
+A Streamlit application that analyzes a student's own past exam papers using OCR, sentence embeddings, unsupervised topic clustering, retrieval-augmented generation, and a multi-agent LLM workflow to discover recurring question patterns and generate probable future exam questions.
 
-## Features
 
-- **Past Exam Paper Upload** — Extract questions from PDF exam papers with Mistral OCR
-- **Subject PDF Upload** — Add syllabus, notes, or textbook PDFs as Mistral OCR context
-- **Dynamic Topic Discovery** — KMeans clustering on your exam content (no predefined topics)
-- **Retrieval-Augmented Prediction** — Pinecone stores embeddings and reranking improves retrieval quality
-- **LangGraph-Style Workflow** — Separate past-paper, lecture-pdf, prediction, and evaluation agents coordinated in one graph
-- **Mistral Question Generation** — Mistral chat completions generate new questions from your patterns
-- **Multi-Subject Support** — Upload papers for multiple subjects and filter analysis
-- **Interactive Dashboard** — Topic charts, similarity search, retrieval evaluation, analytics, CSV/PDF export
 
-## Tech Stack
+---
 
-- Python 3.12+, Streamlit, LangGraph, Mistral API, Pinecone
-- Sentence Transformers, Scikit-learn, NLTK
-- Plotly, Pandas, Mistral OCR, cross-encoder reranking
+## 1. Problem Statement
 
-## Setup
+Students preparing for exams often revisit years of past papers manually, trying to spot which topics repeat and which questions are likely to reappear. This is slow, subjective, and doesn't scale across subjects. This project automates that process: it ingests past exam papers (and optional syllabus/lecture material) for **any subject**, discovers the underlying topic structure directly from the content, and uses a language model — grounded in retrieved, relevant context — to draft new questions that plausibly reflect the observed exam pattern.
+
+The system is intentionally domain-agnostic: no subject list, question bank, or topic taxonomy is hard-coded. Everything is derived from what the user uploads.
+
+---
+
+## 2. AI Techniques Implemented
+
+This project satisfies the assignment's "minimum three techniques" requirement with the following:
+
+| # | Technique | Where it's used |
+|---|---|---|
+| 1 | **NLP — text pre/post-processing** | `src/preprocessing/`, `src/classification/topic_classifier.py`: OCR text cleaning, tokenization, stopword removal, lemmatization, question segmentation |
+| 2 | **Transformer-based models** | `src/embeddings/embedder.py` (BGE sentence embeddings), `src/retrieval/reranker.py` (cross-encoder reranking), `src/classification/bert_classifier.py` (zero-shot DistilBERT classification) |
+| 3 | **Prompt engineering** | `src/generation/question_generator.py`: three selectable strategies — direct, chain-of-thought, and context-aware (retrieval-grounded) prompting for the Mistral LLM |
+| 4 (bonus) | **Retrieval-Augmented Generation** | `src/retrieval/pinecone_store.py` + reranker feed retrieved context into generation, evaluated quantitatively (see §6) |
+
+---
+
+## 3. System Architecture
+
+```
+                 ┌─────────────────────┐
+ PDF Upload ───▶ │   Mistral OCR /      │
+ (past papers,   │   pdfplumber/pypdf   │
+ lecture notes)  │   extraction         │
+                 └──────────┬───────────┘
+                            ▼
+                 ┌─────────────────────┐
+                 │  Text Cleaning &     │
+                 │  Question Segment.   │  (src/preprocessing)
+                 └──────────┬───────────┘
+                            ▼
+                 ┌─────────────────────┐
+                 │  Sentence Embeddings │  (BAAI/bge-large-en-v1.5)
+                 └──────────┬───────────┘
+                            ▼
+        ┌───────────────────┴────────────────────┐
+        ▼                                         ▼
+┌───────────────────┐                   ┌───────────────────────┐
+│ KMeans Topic        │                   │ Pinecone Vector Index  │
+│ Clustering           │                   │ (semantic retrieval)   │
+│ (dynamic, no fixed   │                   └───────────┬────────────┘
+│ topic list)          │                               ▼
+└──────────┬──────────┘                   ┌───────────────────────┐
+           │                               │ Cross-Encoder Reranker │
+           │                               └───────────┬────────────┘
+           ▼                                            ▼
+┌────────────────────────────────────────────────────────────────┐
+│           Multi-Agent Workflow (LangGraph-style)                 │
+│  PastPaperAgent → LecturePdfAgent → PredictionAgent → Eval Agent  │
+└──────────────────────────────┬───────────────────────────────────┘
+                                 ▼
+                    ┌────────────────────────┐
+                    │ Mistral LLM              │
+                    │ (question generation,    │
+                    │  prompt-engineered)       │
+                    └───────────┬───────────────┘
+                                 ▼
+                    ┌────────────────────────┐
+                    │ Streamlit Dashboard      │
+                    │ (topics, predictions,    │
+                    │  evaluation, export)      │
+                    └────────────────────────┘
+```
+
+**Agent roles** (`src/agents/exam_agents.py`):
+- **PastPaperAgent** — ingests past exam PDFs into structured question rows
+- **LecturePdfAgent** — ingests syllabus/lecture PDFs into reference chunks
+- **ExamAgentSystem** — indexes both corpora into Pinecone
+- **PredictionAgent** — retrieves relevant context, reranks it, and prepares the generation prompt
+- **EvaluationAgent** — reuses the retrieval path to compute ranking quality metrics
+
+If `langgraph` is installed, these steps run as nodes in a `StateGraph`; otherwise the app falls back to the same steps called directly in Python, so the workflow behaves identically either way.
+
+---
+
+## 4. Features
+
+- **Past exam paper upload** — extracts individual questions from PDF exam papers via Mistral OCR
+- **Subject reference upload** — syllabus/notes/textbook PDFs indexed as retrieval context
+- **Dynamic topic discovery** — KMeans clustering (silhouette-selected *k*) over embeddings, no predefined topics
+- **Retrieval-augmented question prediction** — Pinecone retrieval + cross-encoder reranking + Mistral generation
+- **Configurable prompting** — direct / chain-of-thought / context-aware strategies, adjustable difficulty
+- **Multi-subject support** — any number of subjects, filterable throughout the dashboard
+- **Retrieval evaluation** — Precision@k, Recall@k, MRR, nDCG computed on demand
+- **Analytics dashboard** — topic trends, year-wise distribution, similarity search, CSV/PDF export
+
+---
+
+## 5. Tech Stack
+
+| Layer | Tools |
+|---|---|
+| Interface | Streamlit, Plotly |
+| OCR / extraction | Mistral OCR, pdfplumber, pypdf |
+| NLP | NLTK, spaCy |
+| Embeddings | Sentence-Transformers (`BAAI/bge-large-en-v1.5`) |
+| Classification | DistilBERT zero-shot (`typeform/distilbert-base-uncased-mnli`) |
+| Clustering | scikit-learn (KMeans, TF-IDF, silhouette score) |
+| Vector store | Pinecone |
+| Reranking | Cross-encoder (`ms-marco-MiniLM-L-6-v2`) |
+| Generation | Mistral chat completions |
+| Orchestration | LangGraph-style multi-agent workflow |
+| Language / runtime | Python 3.12+ |
+
+---
+
+## 6. Retrieval Evaluation Results
+
+Retrieval quality was measured against relevance-labelled queries over the indexed exam corpus (Precision/Recall/MRR/nDCG @ k = 5):
+
+| Metric | Score | Rating |
+|---|---|---|
+| Precision@5 | 0.664 | Good |
+| Recall@5 | 1.000 | Perfect |
+| MRR | 0.513 | Moderate |
+| nDCG@5 | 0.731 | Good |
+
+**Interpretation:** Recall is perfect — no relevant past question is ever missed by the retriever, which matters most for this use case since a missed pattern means a missed prediction signal. MRR indicates the single best match typically lands around rank 2 rather than rank 1, suggesting the cross-encoder reranker has room to improve with domain-specific fine-tuning. Full methodology, formulas, and improvement suggestions are in the [Retrieval Evaluation Metrics](#retrieval-evaluation-metrics-detail) section below and can be reproduced live from the app's **Retrieval Evaluation** tab.
+
+---
+
+## 7. Project Structure
+
+```
+Exam-Pattern-Analysis/
+├── app/
+│   └── streamlit_app.py         # Main dashboard entry point
+├── src/
+│   ├── preprocessing/            # PDF extraction, OCR, text cleaning
+│   ├── ocr/                      # Mistral OCR client
+│   ├── embeddings/               # Sentence embedding + caching
+│   ├── classification/           # Topic clustering, BERT question typing
+│   ├── retrieval/                # Pinecone store, cross-encoder reranker
+│   ├── generation/                # Prompt-engineered question generation
+│   ├── evaluation/                # Retrieval metrics, analytics
+│   ├── agents/                   # Multi-agent orchestration (LangGraph)
+│   ├── pipeline.py               # Data loading + analysis pipeline
+│   └── utils.py                  # Shared paths/logging
+├── scripts/                       # Setup, validation, smoke-test utilities
+├── data/
+│   ├── raw/                       # Uploaded source PDFs
+│   └── processed/                 # Generated questions.csv, materials.csv
+├── reports/                       # Final report, organized outputs, logs
+├── notebooks/                     # Exploratory notebooks
+└── requirements.txt
+```
+
+---
+
+## 8. Setup & Installation
 
 ```powershell
-Set-Location C:\Users\User\exam-pattern-analysis
+git clone https://github.com/Parakkrama24/Exam-Pattern-Analysis.git
+cd Exam-Pattern-Analysis
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 python -c "import nltk; nltk.download('punkt'); nltk.download('punkt_tab'); nltk.download('stopwords'); nltk.download('wordnet'); nltk.download('omw-1.4')"
-copy .env.example .env
 ```
 
-Edit `.env` and set your API keys:
+Create a `.env` file in the project root with:
 
 ```env
 MISTRAL_API_KEY=your-real-key-here
@@ -41,218 +181,57 @@ PINECONE_INDEX_NAME=quickstart
 MISTRAL_CHAT_MODEL=mistral-medium-latest
 ```
 
-## Run
+## 9. Running the App
 
 ```powershell
 streamlit run app\streamlit_app.py
 ```
 
-## How to Use
+## 10. How to Use
 
-### 1. Upload Past Exam Papers
-- Go to **Upload & Process → Past Exam Papers**
-- Enter any **subject name** (not limited to a fixed list)
-- Set the **exam year**
-- Upload one or more PDF exam papers
-- Click **Process Exam Papers**
+1. **Upload past exam papers** — *Upload & Process → Past Exam Papers*: enter a subject name and year, upload PDFs, click **Process**.
+2. **Upload subject reference material** *(optional, recommended)* — *Upload & Process → Subject PDFs*: syllabus/notes/textbooks, OCR-indexed as retrieval context.
+3. **Explore results**:
+   - **Topic Analysis** — discovered topics, filterable by subject
+   - **Question Predictions** — pick a subject + topic, choose a prompting strategy and difficulty, generate new questions
+   - **Similarity Search** — semantic search across the indexed corpus
+   - **Retrieval Evaluation** — live Precision@k / Recall@k / MRR / nDCG
+   - **Analytics Dashboard** — corpus-wide statistics and trends
 
-### 2. Upload Subject Reference PDFs (optional but recommended)
-- Go to **Upload & Process → Subject PDFs**
-- Enter the matching **subject name**
-- Upload syllabus, notes, or textbook PDFs
-- These are OCR-processed by Mistral and indexed in Pinecone as retrieval context
-
-### 3. Analyze & Generate
-- **Topic Analysis** — Discovered topics from your papers (filter by subject in sidebar)
-- **Question Predictions** — Select subject + discovered topic → retrieval is reranked and Mistral generates new questions
-- **Similarity Search** — Pinecone-backed semantic search over uploaded question bank and lecture chunks
-- **Retrieval Evaluation** — Precision@k, Recall@k, MRR, and nDCG for retrieval quality
-- **Analytics Dashboard** — Stats across all uploaded subjects
-
-### Architecture
-
-1. Upload a PDF in the Streamlit app.
-2. Mistral OCR converts the PDF into page-level Markdown/text.
-3. Past-paper PDFs become question rows; lecture PDFs become chunk rows.
-4. Sentence embeddings are created and stored in Pinecone.
-5. Retrieval pulls the most relevant chunks, then a cross-encoder reranks them.
-6. The workflow routes into retrieval, reranking, and Mistral chat completions.
-7. Evaluation metrics measure retrieval quality from the indexed corpus.
-
-##  API Key
-
-Required runtime keys:
-- `MISTRAL_API_KEY` for OCR and question generation
-- `PINECONE_API_KEY` and `PINECONE_INDEX_NAME` for retrieval
-
-## PDF Tips
-
-- Use **text-based PDFs** (not scanned images)
-- Exam papers should have **numbered questions** (`1.`, `Q1.`, etc.)
-- Image-based PDFs show a friendly error message
-
-## Project Structure
-
-```
-exam-pattern-analysis/
-├── data/raw/              # Uploaded PDFs saved here
-├── data/processed/        # questions.csv, subject_materials.csv
-├── app/streamlit_app.py   # Main dashboard
-├── src/                   # NLP, clustering, retrieval, generation, workflow agents
-└── scripts/               # Utility scripts
-```
-
-## Retrieval Evaluation Metrics
-
-The **Retrieval Evaluation** tab in the dashboard measures how well the Pinecone vector retrieval + cross-encoder reranking pipeline performs. These metrics are computed against a set of relevance-labelled queries over the indexed exam question corpus.
-
-### What Is Being Evaluated?
-
-When you select a topic and generate questions, the system:
-1. Embeds your query using Sentence Transformers
-2. Retrieves the top-K most similar chunks from Pinecone
-3. Reranks them using a cross-encoder model
-4. Feeds the reranked context into Mistral for question generation
-
-### Agent Workflow
-
-The app keeps the agent logic in a single Python process, but the control flow is organized like a LangGraph pipeline:
-
-1. `PastPaperAgent` ingests past exam PDFs into question rows.
-2. `LecturePdfAgent` ingests syllabus/notes PDFs into reference chunks.
-3. `ExamAgentSystem` indexes both corpora into Pinecone.
-4. `PredictionAgent` retrieves context, reranks results, and prepares generation inputs.
-5. `EvaluationAgent` reuses the retrieval path to compute ranking metrics.
-
-If `langgraph` is installed, the workflow wrapper in `src/agents/exam_agents.py` routes these steps through a graph object; otherwise the app falls back to the same imperative Python calls.
-
-The evaluation metrics measure the **quality of steps 2–3** — how relevant and well-ordered the retrieved results are.
+**PDF tips:** use text-based PDFs where possible; numbered questions (`1.`, `Q1.`) parse most reliably; image-only PDFs are still supported via OCR but will be slower.
 
 ---
 
-### Metrics Explained
+## Retrieval Evaluation Metrics (detail)
 
-#### 🎯 Precision@5
-> *Out of the 5 results returned, how many are actually relevant?*
+<details>
+<summary>Expand for metric formulas, score interpretation bands, and improvement strategies</summary>
 
-**Formula:**
-```
-Precision@5 = (Number of relevant results in top 5) / 5
-```
+#### Precision@5
+`Precision@5 = (relevant results in top 5) / 5`
+Our result: **0.664** — roughly 3–4 of 5 retrieved chunks are relevant; Mistral's instruction-following tolerates the remaining noise reasonably well.
 
-| Score Range | Meaning |
-|-------------|---------|
-| 1.00 | All 5 results are relevant — perfect |
-| 0.60–0.79 | 3–4 relevant results — good |
-| < 0.40 | More than half are irrelevant — poor |
+#### Recall@5
+`Recall@5 = (relevant results found in top 5) / (total relevant results in corpus)`
+Our result: **1.000** — every relevant past question/chunk is retrieved. This is the highest-priority metric for the project, since a missed relevant question means a pattern never reaches the generator.
 
-**Our Result: `0.664`** — About 3–4 out of 5 retrieved chunks are relevant. Acceptable, as Mistral can filter minor noise from the context.
+#### MRR (Mean Reciprocal Rank)
+`MRR = average(1 / rank of first relevant result)`
+Our result: **0.513** — the first relevant result appears around rank 2 on average; a stronger reranker signal would push this toward 1.0.
 
-**Relevance to this project:** Medium — even if 1–2 chunks are off-topic, Mistral's instruction following handles the noise reasonably well.
+#### nDCG@5
+`nDCG@5 = DCG@5 / Ideal DCG@5`
+Our result: **0.731** — relevant content is generally ranked near the top, which matters because Mistral processes retrieved chunks in order.
 
----
+**Improvement strategies:** stricter similarity thresholds before reranking (Precision); domain-specific reranker fine-tuning (MRR); wider candidate pool before reranking, e.g. top-20 → top-5 (nDCG); current embedding/indexing already achieves ceiling performance on Recall.
 
-#### 🔍 Recall@5
-> *Out of ALL relevant documents in the corpus, how many did the system find within the top 5?*
-
-**Formula:**
-```
-Recall@5 = (Relevant results found in top 5) / (Total relevant results in corpus)
-```
-
-| Score Range | Meaning |
-|-------------|---------|
-| 1.00 | Every relevant result was retrieved — perfect |
-| 0.70–0.99 | Most relevant content retrieved — good |
-| < 0.50 | Significant relevant content missed — poor |
-
-**Our Result: `1.000`** ⭐ — Every relevant past exam question/chunk is retrieved within the top 5. Nothing is missed.
-
-**Relevance to this project:** **Highest priority.** Missing a relevant past question means a key exam pattern is never passed to Mistral, leading to weaker predictions. A perfect score here is critical.
+</details>
 
 ---
 
-#### 🥇 MRR (Mean Reciprocal Rank)
-> *On average, at what position does the FIRST relevant result appear?*
+## Known Limitations
 
-**Formula:**
-```
-MRR = average of (1 / rank of first relevant result) across all queries
-```
+- Requires valid `MISTRAL_API_KEY` and `PINECONE_API_KEY` to run end-to-end; without them, OCR, retrieval, and generation are unavailable.
+- Topic labels are derived from TF-IDF keywords over clusters, so label quality depends on corpus size — very small uploads (a handful of questions) produce less meaningful clusters.
+- Scanned/image-only PDFs rely on Mistral OCR and take longer to process than text-based PDFs.
 
-| Score | First Relevant Result Appears At |
-|-------|----------------------------------|
-| 1.00 | Position 1 (always first) |
-| 0.50 | Position ~2 |
-| 0.33 | Position ~3 |
-| < 0.25 | Position 4 or later — poor |
-
-**Our Result: `0.513`** — The most relevant result appears at approximately **rank 2** on average.
-
-**Relevance to this project:** High — the cross-encoder reranker should push the best-matching past question to rank 1. An MRR below 0.6 suggests the reranker ordering could be improved.
-
----
-
-#### 📈 nDCG@5 (Normalized Discounted Cumulative Gain)
-> *Are the most relevant results ranked highest? Results at lower positions are penalised.*
-
-**Formula:**
-```
-nDCG@5 = DCG@5 / Ideal DCG@5
-
-DCG@5 = sum of (relevance_score / log2(rank + 1)) for rank 1 to 5
-```
-
-| Score Range | Meaning |
-|-------------|---------|
-| 0.90–1.00 | Near-perfect ranking — excellent |
-| 0.70–0.89 | Good ranking quality |
-| 0.50–0.69 | Moderate — ranking could be improved |
-| < 0.50 | Poor ranking — relevant results buried |
-
-**Our Result: `0.731`** — Relevant content is ranked near the top. The reranker is performing well overall.
-
-**Relevance to this project:** Very high — Mistral processes retrieved chunks in order. If the most relevant content is buried at rank 5, the generated questions will be less accurate. Good nDCG means better question generation quality.
-
----
-
-### Results Summary
-
-| Metric | Score | Rating | Priority for This Project |
-|--------|-------|--------|--------------------------|
-| **Precision@5** | 0.664 | ✅ Good | Medium |
-| **Recall@5** | 1.000 | 🏆 Perfect | **Highest** |
-| **MRR** | 0.513 | ⚠️ Moderate | High |
-| **nDCG@5** | 0.731 | ✅ Good | Very High |
-
----
-
-### How to Improve Scores
-
-| Metric | Improvement Strategy |
-|--------|---------------------|
-| **Precision@5** | Use stricter similarity thresholds in Pinecone; filter low-score chunks before reranking |
-| **MRR** | Fine-tune the cross-encoder reranker on domain-specific (exam) data |
-| **nDCG@5** | Increase the candidate pool (retrieve top-20, rerank to top-5) for better reranking signal |
-| **Recall@5** | Already perfect — maintain current embedding model and indexing strategy |
-
----
-
-### Where to View Metrics in the App
-
-Navigate to **Retrieval Evaluation** tab in the Streamlit dashboard to:
-- Run live evaluation against your uploaded exam corpus
-- Adjust the value of `k` (default: 5) to test Precision@k, Recall@k, and nDCG@k
-- Compare performance before and after uploading additional reference PDFs
-
----
-
-## Screenshots
-
-
-## Team Members
-
-
-## License
-
-MIT License
