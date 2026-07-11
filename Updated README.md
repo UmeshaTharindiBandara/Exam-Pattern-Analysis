@@ -4,7 +4,7 @@
 
 A Streamlit application that analyzes a student's own past exam papers using OCR, sentence embeddings, unsupervised topic clustering, retrieval-augmented generation, and a multi-agent LLM workflow to discover recurring question patterns and generate probable future exam questions.
 
-
+YouTube Link of the project: https://youtu.be/IjkuVFnx1JY
 
 ---
 
